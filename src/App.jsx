@@ -99,7 +99,7 @@ async function yahooFetch(path) {
     try {
       const res = await fetch(proxy(base), {
         headers: { "Accept": "application/json" },
-        signal: AbortSignal.timeout(IS_MOBILE ? 15000 : 9000),
+        signal: AbortSignal.timeout(IS_MOBILE ? 20000 : 9000),
       });
       if (!res.ok) continue;
       const data = await res.json();
