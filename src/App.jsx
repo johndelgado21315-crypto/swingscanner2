@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+
+     import React, { useState, useEffect, useCallback, useRef } from "react";
 
 // ── Viewport meta injection (mobile) ────────────────────────────────────────
 if (typeof document !== "undefined") {
@@ -3806,18 +3807,65 @@ export default function SwingScanner() {
     if (abortRef.current) abortRef.current=false;
     abortRef.current=true;
     setIsScanning(true); setStocks([]); setScanProgress(0); setErrorMap({});
-    const batchSize  = IS_MOBILE ? 2 : 3;
-    const batchDelay = IS_MOBILE ? 400 : 250;
-    for (let i=0; i<list.length; i+=batchSize) {
-      if (!abortRef.current) break;
-      await Promise.all(list.slice(i,i+batchSize).map(s=>loadSingle(s)));
-      setScanProgress(Math.round(Math.min(100,((i+batchSize)/list.length)*100)));
-      await new Promise(r=>setTimeout(r,batchDelay));
-    }
+
+    // ── Cache layer: skip re-fetching symbols cached in last 15 min ──
+    const CACHE_KEY = "swingscanner_cache";
+    const CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+    let cache = {};
+    try { cache = JSON.parse(localStorage.getItem(CACHE_KEY)||"{}"); } catch {}
+    const now = Date.now();
+
+    let completed = 0;
+    const total = list.length;
+
+    // ── Fire ALL symbols in parallel, show results as each one finishes ──
+    await Promise.all(list.map(async sym => {
+      if (!abortRef.current) return;
+      // Serve from cache if fresh
+      if (cache[sym] && (now - cache[sym].ts) < CACHE_TTL) {
+        setStocks(prev => {
+          if (prev.find(s=>s.sym===sym)) return prev;
+          return [...prev, cache[sym].data];
+        });
+        completed++;
+        setScanProgress(Math.round((completed/total)*100));
+        return;
+      }
+      // Otherwise fetch
+      await loadSingle(sym);
+      completed++;
+      setScanProgress(Math.round((completed/total)*100));
+    }));
+
+    // ── Save fresh results to cache ──
+    setStocks(current => {
+      const updated = {...cache};
+      current.forEach(s => { updated[s.sym] = { ts: now, data: s }; });
+      try { localStorage.setItem(CACHE_KEY, JSON.stringify(updated)); } catch {}
+      return current;
+    });
+
     setIsScanning(false); setLastUpdate(new Date()); abortRef.current=false;
   },[loadSingle]);
 
-  useEffect(()=>{runScan(watchlist);},[]);
+  const runFullScan = useCallback(()=>runScan(watchlist),[runScan,watchlist]);
+
+  useEffect(()=>{
+    // ── Load cached data instantly so Top Picks shows on open ──
+    try {
+      const cache = JSON.parse(localStorage.getItem("swingscanner_cache")||"{}");
+      const CACHE_TTL = 15 * 60 * 1000;
+      const fresh = Object.values(cache)
+        .filter(c => (Date.now() - c.ts) < CACHE_TTL)
+        .map(c => c.data);
+      if (fresh.length > 0) {
+        setStocks(fresh);
+        setLastUpdate(new Date(Object.values(cache)[0]?.ts||Date.now()));
+      }
+    } catch {}
+    // Then run a fresh scan in background
+    runScan(watchlist);
+  },[]);
 
   const filtered = stocks
     .filter(s=>FILTERS[filter](s))
@@ -3877,6 +3925,13 @@ export default function SwingScanner() {
             padding:isMobile?"6px 10px":"6px 14px",cursor:isScanning?"default":"pointer",letterSpacing:"1px",fontSize:"10px"}}>
             ⟳{isMobile?"":" RESCAN"}
           </button>
+          {isMobile&&!isScanning&&stocks.length>0&&stocks.length<watchlist.length&&(
+            <button onClick={runFullScan}
+              style={{background:"#0d2a10",border:"1px solid #1a6030",color:"#00ff88",
+              padding:"6px 10px",cursor:"pointer",letterSpacing:"1px",fontSize:"9px"}}>
+              +ALL {watchlist.length}
+            </button>
+          )}
         </div>
       </div>
 
