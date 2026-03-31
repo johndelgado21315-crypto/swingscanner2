@@ -3719,7 +3719,7 @@ const FILTERS = {
 export default function SwingScanner() {
   const [stocks, setStocks]       = useState([]);
   const [selected, setSelected]   = useState(null);
-  const [tab, setTab]             = useState("scanner");
+  const [tab, setTab]             = useState(typeof window!=="undefined"&&window.innerWidth<768?"picks":"scanner");
   const [filter, setFilter]       = useState("Active Setups");
   const [sortBy, setSortBy]       = useState("score");
   const [search, setSearch]       = useState("");
@@ -3733,6 +3733,7 @@ export default function SwingScanner() {
   const abortRef = useRef(null);
   const isMobile = useIsMobile();
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
+  const [showTop10, setShowTop10] = useState(true);
   const mono = "'Courier New','Lucida Console',monospace";
 
   const loadSingle = useCallback(async (sym) => {
@@ -3829,6 +3830,8 @@ export default function SwingScanner() {
       sortBy==="chg"         ? b.chg-a.chg :
       sortBy==="rr"          ? b.rr-a.rr : b.score-a.score);
 
+  const displayStocks = (isMobile && showTop10) ? filtered.slice(0, 10) : filtered;
+
   const sel = selected ? stocks.find(s=>s.sym===selected) : null;
 
   // Top picks
@@ -3840,7 +3843,7 @@ export default function SwingScanner() {
   const breakColor  = (b)  => b==="bullish"?"#00ff88":b==="bearish"?"#ff4466":"#ffaa00";
 
   return (
-    <div style={{background:"#060e1c",color:"#c8d8f0",fontFamily:mono,minHeight:"100vh",fontSize:"12px",paddingBottom:isMobile?"64px":"0"}}>
+    <div style={{background:"#060e1c",color:"#c8d8f0",fontFamily:mono,minHeight:"100vh",fontSize:"12px",paddingBottom:isMobile?"72px":"0"}}>
 
       {/* ── HEADER ── */}
       <div style={{background:"#080f1e",borderBottom:"1px solid #1a3050",padding:isMobile?"8px 12px":"10px 18px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
@@ -3877,7 +3880,7 @@ export default function SwingScanner() {
         </div>
       </div>
 
-      {/* ── TABS ── */}
+      {/* ── TABS — Desktop: full bar, Mobile: bottom 2-tab nav ── */}
       {!isMobile&&<div style={{display:"flex",background:"#080f1c",borderBottom:"1px solid #1a3050",overflowX:"auto"}}>
         {[["scanner","SCANNER"],["picks","TOP PICKS"],["rotation","SECTOR ROTATION"],["intermarket","INTERMARKET"],["heatmap","HEATMAP"],["watchlist","WATCHLIST"],["guide","PATTERN GUIDE"],["bottomfinder","📉 BOTTOM FINDER"]].map(([k,label])=>(
           <button key={k} onClick={()=>setTab(k)} style={{
@@ -3888,6 +3891,26 @@ export default function SwingScanner() {
           }}>{label}</button>
         ))}
       </div>}
+
+      {/* Mobile bottom tab bar — Top Picks & Bottom Finder only */}
+      {isMobile&&(
+        <div style={{position:"fixed",bottom:0,left:0,right:0,zIndex:600,
+          background:"#080f1e",borderTop:"1px solid #1a3050",
+          display:"flex",height:"56px"}}>
+          {[["picks","⭐","TOP PICKS"],["bottomfinder","📉","BOTTOM FINDER"]].map(([k,icon,label])=>(
+            <button key={k} onClick={()=>setTab(k)} style={{
+              flex:1,background:tab===k?"#0d1f3c":"transparent",border:"none",
+              borderTop:tab===k?"2px solid #00d4ff":"2px solid transparent",
+              color:tab===k?"#00d4ff":"#3a5a7a",
+              display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+              cursor:"pointer",fontFamily:mono,gap:"2px",
+            }}>
+              <span style={{fontSize:"20px",lineHeight:1}}>{icon}</span>
+              <span style={{fontSize:"9px",letterSpacing:"1px"}}>{label}</span>
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* ══ SCANNER TAB ══ */}
       {tab==="scanner"&&(
@@ -3912,7 +3935,15 @@ export default function SwingScanner() {
                 <option value="rsi">↓ RSI</option>
                 <option value="chg">↓ % CHG</option>
               </select>
-              <span style={{fontSize:"10px",color:"#3a5a7a"}}>{filtered.length} results</span>
+              <span style={{fontSize:"10px",color:"#3a5a7a"}}>{isMobile&&showTop10?`TOP 10 of ${filtered.length}`:filtered.length+" results"}</span>
+              {isMobile&&(
+                <button onClick={()=>setShowTop10(v=>!v)}
+                  style={{background:showTop10?"#00d4ff22":"#0d1f3c",border:`1px solid ${showTop10?"#00d4ff":"#1a4060"}`,
+                    color:showTop10?"#00d4ff":"#3a5a7a",padding:"4px 10px",cursor:"pointer",
+                    fontFamily:mono,fontSize:"10px",letterSpacing:"1px",borderRadius:"2px"}}>
+                  {showTop10?"TOP 10 ✓":"ALL"}
+                </button>
+              )}
               <span style={{marginLeft:"auto",fontSize:"9px",color:"#1a3a5a"}}>
                 {stocks.filter(s=>s.pattern.stage==="Confirmed").length} confirmed · {stocks.filter(s=>s.divergence?.bullDiv||s.divergence?.bearDiv).length} divergences · <span style={{color:"#ff6600"}}>{stocks.filter(s=>s.pattern.stage==="Invalidated").length} invalidated</span>
               </span>
@@ -3935,7 +3966,7 @@ export default function SwingScanner() {
                   <div style={{fontSize:"10px",marginTop:"8px",color:"#1a3050"}}>Fetching OHLCV data · Detecting {Object.keys(PATTERNS_DB).length} pattern types</div>
                 </div>
               )}
-              {filtered.map(s=>{
+              {displayStocks.map(s=>{
                 const isSel=selected===s.sym;
                 const dc=breakColor(s.pattern.breakout);
                 const cc=s.chg>=0?"#00ff88":"#ff4466";
