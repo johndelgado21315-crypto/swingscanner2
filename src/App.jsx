@@ -1,5 +1,12 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
+// ── Service Worker registration (PWA — caches app shell + API responses) ─────
+if (typeof window !== "undefined" && "serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch(() => {/* SW optional */});
+  });
+}
+
 // ── Viewport meta injection (mobile) ────────────────────────────────────────
 if (typeof document !== "undefined") {
   let vm = document.querySelector('meta[name="viewport"]');
@@ -68,32 +75,66 @@ const DEFAULT_WATCHLIST = [
 ];
 
 // ══════════════════════════════════════════════════════════════════════════════
-// CACHE LAYER — localStorage scan cache + in-memory data cache
+// CACHE LAYER — IndexedDB (prices) + localStorage (watchlist) + in-memory (hot)
 // ══════════════════════════════════════════════════════════════════════════════
-const SCAN_CACHE_KEY  = "swt_scan_v2";   // localStorage key for full scan results
 const WL_CACHE_KEY    = "swt_wl_v1";    // localStorage key for custom watchlist
-const SCAN_CACHE_TTL  = 20 * 60 * 1000; // 20 min — stale results trigger bg refresh
-const DATA_CACHE_TTL  = 15 * 60 * 1000; // 15 min — in-memory raw price/quote cache
+const SCAN_CACHE_TTL  = 20 * 60 * 1000; // 20 min — stale scan triggers bg refresh
+const DATA_CACHE_TTL  = 15 * 60 * 1000; // 15 min — per-symbol price TTL
 
-// In-memory per-symbol cache (survives re-scans within the same session)
-const dataCache = {}; // { [sym]: { prices, quote, ts: Date.now() } }
+// ── L1: In-memory hot cache (same session, zero-latency) ─────────────────────
+const dataCache = {}; // { [sym]: { prices, quote, ts } }
 
-function loadScanCache() {
-  try {
-    const raw = localStorage.getItem(SCAN_CACHE_KEY);
-    if (!raw) return null;
-    const { stocks, ts } = JSON.parse(raw);
-    if (!Array.isArray(stocks) || !stocks.length) return null;
-    return { stocks, ts, stale: Date.now() - ts > SCAN_CACHE_TTL };
-  } catch { return null; }
+// ── L2: IndexedDB (no 5 MB limit, async, survives page close) ────────────────
+const IDB_NAME = "swt_v2";
+const idb = (() => {
+  let _db = null;
+  async function open() {
+    if (_db) return _db;
+    return new Promise((res, rej) => {
+      const r = typeof indexedDB !== "undefined" ? indexedDB.open(IDB_NAME, 1) : null;
+      if (!r) { rej(new Error("no idb")); return; }
+      r.onupgradeneeded = e => {
+        ["prices","scan"].forEach(name => {
+          if (!e.target.result.objectStoreNames.contains(name))
+            e.target.result.createObjectStore(name, { keyPath: "key" });
+        });
+      };
+      r.onsuccess = e => { _db = e.target.result; res(_db); };
+      r.onerror   = rej;
+    });
+  }
+  async function get(store, key) {
+    try {
+      const db = await open();
+      return new Promise(res => {
+        const r = db.transaction(store,"readonly").objectStore(store).get(key);
+        r.onsuccess = () => res(r.result ?? null);
+        r.onerror   = () => res(null);
+      });
+    } catch { return null; }
+  }
+  async function put(store, key, val) {
+    try {
+      const db = await open();
+      await new Promise(res => {
+        const tx = db.transaction(store,"readwrite");
+        tx.objectStore(store).put({ key, ...val });
+        tx.oncomplete = res; tx.onerror = res;
+      });
+    } catch { /* IDB unavailable in some private-mode browsers */ }
+  }
+  return { get, put };
+})();
+
+async function loadScanCache() {
+  // Try IDB first (no size limit), fall back to nothing
+  const r = await idb.get("scan", "latest");
+  if (!r || !Array.isArray(r.stocks) || !r.stocks.length) return null;
+  return { stocks: r.stocks, ts: r.ts, stale: Date.now() - r.ts > SCAN_CACHE_TTL };
 }
 
-function saveScanCache(stocks) {
-  try {
-    // Strip prices array to save space (we re-fetch on bg refresh anyway)
-    // But keep it for offline chart support — just catch quota errors
-    localStorage.setItem(SCAN_CACHE_KEY, JSON.stringify({ stocks, ts: Date.now() }));
-  } catch { /* storage full — skip */ }
+async function saveScanCache(stocks) {
+  await idb.put("scan", "latest", { stocks, ts: Date.now() });
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -111,7 +152,7 @@ async function yahooFetch(path) {
   // Try our own Vercel API route first — fast, no CORS issues
   const symMatch = path.match(/chart\/([^?]+)/);
   const sym = symMatch?.[1];
-  const isHistory = path.includes("range=6mo");
+  const isHistory = /range=\d+mo/.test(path) && path.includes("interval=1d");
   if (sym) {
     try {
       const res = await fetch(`/api/quote?symbol=${sym}&type=${isHistory?"history":"quote"}`,
@@ -140,7 +181,9 @@ async function yahooFetch(path) {
 }
 
 async function fetchHistory(symbol) {
-  const data = await yahooFetch(`/v8/finance/chart/${symbol}?interval=1d&range=6mo&includePrePost=false`);
+  // Mobile fetches 3 months (≈65 bars) instead of 6 — half the data, same pattern coverage
+  const range = IS_MOBILE ? "3mo" : "6mo";
+  const data = await yahooFetch(`/v8/finance/chart/${symbol}?interval=1d&range=${range}&includePrePost=false`);
   const result = data?.chart?.result?.[0];
   if (!result) throw new Error("No data");
   const { open, high, low, close, volume } = result.indicators.quote[0];
@@ -5347,6 +5390,9 @@ export default function SwingScanner() {
   const isMobile = useIsMobile();
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
   const [isFromCache, setIsFromCache] = useState(false);
+  // Lazy chart enable — desktop renders immediately, mobile waits for browser idle
+  // This gives the list a chance to paint before the expensive SVG renders start
+  const [chartsEnabled, setChartsEnabled] = useState(!IS_MOBILE);
   const mono = "'Courier New','Lucida Console',monospace";
 
   // Persist watchlist changes to localStorage
@@ -5354,28 +5400,46 @@ export default function SwingScanner() {
     try { localStorage.setItem(WL_CACHE_KEY, JSON.stringify(watchlist)); } catch {}
   },[watchlist]);
 
+  // Enable charts on mobile after first paint settles (requestIdleCallback)
+  useEffect(()=>{
+    if (!IS_MOBILE) return;
+    const ric = typeof requestIdleCallback !== "undefined" ? requestIdleCallback : (cb=>setTimeout(cb,150));
+    const id = ric(()=>setChartsEnabled(true));
+    return ()=>{ if (typeof cancelIdleCallback!=="undefined") cancelIdleCallback(id); };
+  },[]);
+
   const loadSingle = useCallback(async (sym, { skipNetwork=false }={}) => {
     try {
       setLoadingMap(m=>({...m,[sym]:true}));
       setErrorMap(m=>({...m,[sym]:null}));
 
       let prices, quote;
-      const cached = dataCache[sym];
       const isOnline = typeof navigator !== "undefined" ? navigator.onLine : true;
 
-      if (cached && (Date.now() - cached.ts < DATA_CACHE_TTL)) {
-        // Fresh in-memory cache hit — no network call needed
-        prices = cached.prices;
-        quote  = cached.quote;
-      } else if (!isOnline || skipNetwork) {
-        // Offline — use stale in-memory data if available, otherwise fail gracefully
-        if (cached) { prices = cached.prices; quote = cached.quote; }
-        else throw new Error("Offline – no cached data");
+      // ── L1: in-memory hot cache (zero latency) ────────────────────────────
+      const hotCached = dataCache[sym];
+      if (hotCached && Date.now() - hotCached.ts < DATA_CACHE_TTL) {
+        prices = hotCached.prices;
+        quote  = hotCached.quote;
       } else {
-        // Normal fetch
-        [prices, quote] = await Promise.all([fetchHistory(sym), fetchQuote(sym)]);
-        // Save to in-memory cache
-        dataCache[sym] = { prices, quote, ts: Date.now() };
+        // ── L2: IndexedDB (fast async, no size limit) ─────────────────────
+        const idbCached = await idb.get("prices", sym);
+        if (idbCached && idbCached.prices && Date.now() - idbCached.ts < DATA_CACHE_TTL) {
+          prices = idbCached.prices;
+          quote  = idbCached.quote;
+          dataCache[sym] = { prices, quote, ts: idbCached.ts }; // promote to L1
+        } else if (!isOnline || skipNetwork) {
+          // ── Offline fallback: use whatever stale data we have ─────────────
+          if (idbCached?.prices) { prices = idbCached.prices; quote = idbCached.quote; }
+          else if (hotCached)    { prices = hotCached.prices;  quote = hotCached.quote; }
+          else throw new Error("Offline – no cached data");
+        } else {
+          // ── L3: Network fetch ─────────────────────────────────────────────
+          [prices, quote] = await Promise.all([fetchHistory(sym), fetchQuote(sym)]);
+          // Persist to both caches
+          dataCache[sym] = { prices, quote, ts: Date.now() };
+          idb.put("prices", sym, { prices, quote, ts: Date.now() }); // fire-and-forget
+        }
       }
 
       if (!prices||prices.length<20) throw new Error("Insufficient data");
@@ -5444,42 +5508,70 @@ export default function SwingScanner() {
     if (abortRef.current) abortRef.current=false;
     abortRef.current=true;
 
-    // ── Stale-while-revalidate: show cache instantly on initial load ──────────
+    // ── Tier 0: try server pre-scan endpoint first (< 1s, no per-symbol calls) ─
+    // The Vercel cron runs /api/scan every 20 min during market hours.
+    // On mobile this alone can replace the entire client-side scan.
+    let serverScores = {};
     if (!backgroundRefresh) {
-      const cached = loadScanCache();
+      try {
+        const sr = await fetch("/api/scan", { signal: AbortSignal.timeout(3000) });
+        if (sr.ok) {
+          const { stocks: srvStocks, ts: srvTs } = await sr.json();
+          if (Array.isArray(srvStocks) && srvStocks.length) {
+            // Server returns pre-sorted lightweight summaries — show immediately
+            // (no prices array, so charts will fill in from full scan below)
+            for (const s of srvStocks) serverScores[s.sym] = s.score || 0;
+            // Merge server scores into existing stock state (don't overwrite prices)
+            setStocks(prev => {
+              if (!prev.length) return prev; // wait for IDB or scan
+              return prev.map(s => {
+                const srv = srvStocks.find(x=>x.sym===s.sym);
+                return srv ? { ...s, score: srv.score, chg: srv.chg ?? s.chg } : s;
+              });
+            });
+          }
+        }
+      } catch { /* /api/scan optional — fall through to IDB/network */ }
+    }
+
+    // ── Stale-while-revalidate: show IDB cache instantly on cold load ─────────
+    let cachedScores = {}; // used for score-ordered scanning below
+    if (!backgroundRefresh) {
+      const cached = await loadScanCache(); // async IDB read
       if (cached) {
-        // Restore cached stocks immediately so the UI isn't blank
         setStocks(cached.stocks);
         setIsFromCache(true);
         setLastUpdate(new Date(cached.ts));
         setScanProgress(100);
+        // Build score map so we scan best candidates first
+        for (const s of cached.stocks) cachedScores[s.sym] = s.score || 0;
 
-        // If data is still fresh AND we're offline, skip network scan
         const isOnline = typeof navigator !== "undefined" ? navigator.onLine : true;
         if (!cached.stale && !isOnline) {
-          setIsScanning(false);
-          abortRef.current=false;
-          return;
+          setIsScanning(false); abortRef.current=false; return;
         }
-        // If online and data is stale (or always revalidate), do a bg refresh
-        // Small delay so the UI can paint the cached results first
-        await new Promise(r=>setTimeout(r,300));
+        await new Promise(r=>setTimeout(r,200)); // let UI paint cached results
       }
     }
 
+    // ── Score-order: scan previously high-scoring stocks first ───────────────
+    // Merge server scores (freshest) with IDB scores for best ordering
+    const mergedScores = { ...cachedScores, ...serverScores };
+    const sortedList = [...list].sort((a,b)=>(mergedScores[b]||0)-(mergedScores[a]||0));
+
     setIsScanning(true);
     if (!backgroundRefresh) { setStocks([]); setScanProgress(0); setErrorMap({}); }
-    const batchSize  = IS_MOBILE ? 2 : 3;
-    const batchDelay = IS_MOBILE ? 400 : 250;
-    for (let i=0; i<list.length; i+=batchSize) {
+    const batchSize  = IS_MOBILE ? 3 : 5; // IDB cache hits make each call fast now
+    const batchDelay = IS_MOBILE ? 200 : 100;
+    for (let i=0; i<sortedList.length; i+=batchSize) {
       if (!abortRef.current) break;
-      await Promise.all(list.slice(i,i+batchSize).map(s=>loadSingle(s)));
-      setScanProgress(Math.round(Math.min(100,((i+batchSize)/list.length)*100)));
-      await new Promise(r=>setTimeout(r,batchDelay));
+      await Promise.all(sortedList.slice(i,i+batchSize).map(s=>loadSingle(s)));
+      setScanProgress(Math.round(Math.min(100,((i+batchSize)/sortedList.length)*100)));
+      if (batchDelay>0) await new Promise(r=>setTimeout(r,batchDelay));
     }
     setIsScanning(false); setIsFromCache(false); setLastUpdate(new Date()); abortRef.current=false;
 
-    // Save fresh results to localStorage for next cold load
+    // Persist fresh results to IDB (fire-and-forget)
     setStocks(cur => { saveScanCache(cur); return cur; });
   },[loadSingle]);
 
@@ -5499,8 +5591,8 @@ export default function SwingScanner() {
   const sel = selected ? stocks.find(s=>s.sym===selected) : null;
 
   // Top picks
-  const topBull = stocks.filter(s=>s.pattern.breakout==="bullish"&&s.pattern.stage!=="Target Hit").sort((a,b)=>b.score-a.score).slice(0,5);
-  const topBear = stocks.filter(s=>s.pattern.breakout==="bearish"&&s.pattern.stage!=="Target Hit").sort((a,b)=>b.score-a.score).slice(0,5);
+  const topBull = stocks.filter(s=>s.pattern.breakout==="bullish"&&s.pattern.stage!=="Target Hit"&&!s.invalidated).sort((a,b)=>b.score-a.score).slice(0,5);
+  const topBear = stocks.filter(s=>s.pattern.breakout==="bearish"&&s.pattern.stage!=="Target Hit"&&!s.invalidated).sort((a,b)=>b.score-a.score).slice(0,5);
 
   const stageColor  = (st) => st==="Confirmed"?"#00ff88":st==="Target Hit"?"#ffdd00":st==="Invalidated"?"#ff6600":"#ffaa00";
   const stageBg     = (st) => st==="Confirmed"?"#0a2a10":st==="Target Hit"?"#1a1500":st==="Invalidated"?"#2a1000":"#2a1800";
@@ -5622,7 +5714,9 @@ export default function SwingScanner() {
                       <div style={{fontSize:"10px",color:cc}}>{s.chg>=0?"+":""}{s.chg.toFixed(2)}%</div>
                       {hasDiverg&&<div style={{fontSize:"9px",color:s.divergence.bullDiv?"#00ff88":"#ff4466"}}>⚡</div>}
                     </div>
-                    <MiniChart prices={s.prices} pattern={s.pattern} width={68} height={36}/>
+                    {chartsEnabled
+                      ? <MiniChart prices={s.prices} pattern={s.pattern} width={68} height={36}/>
+                      : <div style={{width:68,height:36,background:"#0a1428",borderRadius:"2px"}}/>}
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{color:dc,fontSize:"11px",fontWeight:"bold",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{s.pattern.name}</div>
                       <div style={{display:"flex",gap:"6px",marginTop:"3px",alignItems:"center"}}>
@@ -5656,7 +5750,9 @@ export default function SwingScanner() {
                       <div style={{color:dc,fontSize:"10px",letterSpacing:"0.5px"}}>{s.pattern.name}</div>
                       <div style={{fontSize:"8px",color:"#3a5a7a"}}>{s.pattern.category}</div>
                     </div>
-                    <MiniChart prices={s.prices} pattern={s.pattern} width={96} height={40}/>
+                    {chartsEnabled
+                      ? <MiniChart prices={s.prices} pattern={s.pattern} width={96} height={40}/>
+                      : <div style={{width:96,height:40,background:"#0a1428",borderRadius:"2px"}}/>}
                     <span style={{background:stageBg(s.pattern.stage),color:stageColor(s.pattern.stage),
                       border:`1px solid ${stageColor(s.pattern.stage)}40`,
                       padding:"3px 7px",fontSize:"9px",letterSpacing:"0.5px",textAlign:"center"}}>
