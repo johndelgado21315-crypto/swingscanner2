@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 // ── Viewport meta injection (mobile) ────────────────────────────────────────
 if (typeof document !== "undefined") {
@@ -68,6 +68,35 @@ const DEFAULT_WATCHLIST = [
 ];
 
 // ══════════════════════════════════════════════════════════════════════════════
+// CACHE LAYER — localStorage scan cache + in-memory data cache
+// ══════════════════════════════════════════════════════════════════════════════
+const SCAN_CACHE_KEY  = "swt_scan_v2";   // localStorage key for full scan results
+const WL_CACHE_KEY    = "swt_wl_v1";    // localStorage key for custom watchlist
+const SCAN_CACHE_TTL  = 20 * 60 * 1000; // 20 min — stale results trigger bg refresh
+const DATA_CACHE_TTL  = 15 * 60 * 1000; // 15 min — in-memory raw price/quote cache
+
+// In-memory per-symbol cache (survives re-scans within the same session)
+const dataCache = {}; // { [sym]: { prices, quote, ts: Date.now() } }
+
+function loadScanCache() {
+  try {
+    const raw = localStorage.getItem(SCAN_CACHE_KEY);
+    if (!raw) return null;
+    const { stocks, ts } = JSON.parse(raw);
+    if (!Array.isArray(stocks) || !stocks.length) return null;
+    return { stocks, ts, stale: Date.now() - ts > SCAN_CACHE_TTL };
+  } catch { return null; }
+}
+
+function saveScanCache(stocks) {
+  try {
+    // Strip prices array to save space (we re-fetch on bg refresh anyway)
+    // But keep it for offline chart support — just catch quota errors
+    localStorage.setItem(SCAN_CACHE_KEY, JSON.stringify({ stocks, ts: Date.now() }));
+  } catch { /* storage full — skip */ }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // DATA LAYER — Vercel API route (fast) with CORS proxy fallback
 // ══════════════════════════════════════════════════════════════════════════════
 const IS_MOBILE = typeof window !== "undefined" && window.innerWidth < 768;
@@ -99,7 +128,7 @@ async function yahooFetch(path) {
     try {
       const res = await fetch(proxy(base), {
         headers: { "Accept": "application/json" },
-        signal: AbortSignal.timeout(IS_MOBILE ? 20000 : 9000),
+        signal: AbortSignal.timeout(IS_MOBILE ? 15000 : 9000),
       });
       if (!res.ok) continue;
       const data = await res.json();
@@ -610,6 +639,21 @@ function detectPatterns(prices) {
       const topNow=at(topLR,n-1), botNow=at(botLR,n-1);
       if (topNow <= botNow) continue; // lines must not have crossed
 
+      // Anchor trendlines to the most prominent swing high/low on each side of the midpoint.
+      // Full regression through all pivots can pull the line too far from where traders draw it;
+      // anchoring to the highest early high → highest recent high gives a more accurate resistance.
+      const earlyTops=tPts.filter(p=>p.x<=midX), lateTops=tPts.filter(p=>p.x>midX);
+      const earlyBots=bPts.filter(p=>p.x<=midX), lateBots=bPts.filter(p=>p.x>midX);
+      const tL=earlyTops.length?earlyTops.reduce((a,p)=>p.y>a.y?p:a,earlyTops[0]):tPts[0];
+      const tR=lateTops.length ?lateTops.reduce((a,p)=>p.y>a.y?p:a,lateTops[0]) :tPts[tPts.length-1];
+      const bL=earlyBots.length?earlyBots.reduce((a,p)=>p.y<a.y?p:a,earlyBots[0]):bPts[0];
+      const bR=lateBots.length ?lateBots.reduce((a,p)=>p.y<a.y?p:a,lateBots[0]) :bPts[bPts.length-1];
+      const tAS=(tL.x!==tR.x)?(tR.y-tL.y)/(tR.x-tL.x):topLR.slope;
+      const bAS=(bL.x!==bR.x)?(bR.y-bL.y)/(bR.x-bL.x):botLR.slope;
+      const tAAt=(x)=>tR.y+tAS*(x-tR.x);
+      const bAAt=(x)=>bR.y+bAS*(x-bR.x);
+      const topNowA=tAAt(n-1), botNowA=bAAt(n-1);
+
       // Ascending Triangle: flat/near-flat top + clearly rising bottom
       if ((tFlat||(tSlope>-FLAT*2))&&bRise&&bSlope>Math.abs(tSlope)*1.3) {
         const res = tPts.reduce((mx,p)=>p.y>mx?p.y:mx, tPts[0].y);
@@ -618,6 +662,17 @@ function detectPatterns(prices) {
         const apexDist    = (topNow-botNow)/topNow;                        // how tight the apex is
         const apexSc      = Math.max(0, 1-apexDist*10);                    // tighter apex = more reliable
         const aConf = Math.min(93, Math.round(62 + bSlope*midP*200 + touchScore*10 + durationSc*8 + apexSc*5));
+        // ── Murphy apex bar: where rising bottom meets flat resistance ──
+        const aApexX  = bAS !== 0 ? (n-1) + (res - botNowA) / bAS : n + 30;
+        const aBarsToApex = Math.max(0, Math.round(aApexX - (n-1)));
+        const aCompPct    = Math.round(Math.min(99, ((n-1-off) / Math.max(1, aApexX-off)) * 100));
+        const aPatLen = n-1-off, aMidI = off + Math.floor(aPatLen/2);
+        const aEarlyVol = aPatLen>=20 ? prices.slice(off, aMidI).reduce((a,p)=>a+p.volume,0)/Math.max(1,aMidI-off) : 0;
+        const aLateVol  = aPatLen>=20 ? prices.slice(aMidI).reduce((a,p)=>a+p.volume,0)/Math.max(1,n-1-aMidI) : 0;
+        const aVolContracting = aPatLen>=20 && aLateVol < aEarlyVol*0.88;
+        // Ascending triangle: top touches are flat resistance touches, bot pivots are rising lows
+        const aResPivots = tPts.filter(p => Math.abs(p.y - res) / res <= 0.015).map(p=>({i:p.x,v:p.y}));
+        const aBotPivots = bPts.map(p=>({i:p.x,v:p.y}));
         found.push({ name:"Ascending Triangle",
           conf: aConf,
           stage:last>res*0.998?"Confirmed":"Forming",
@@ -625,25 +680,61 @@ function detectPatterns(prices) {
           geo:{ type:"triangle", startI:off,
             topLine:[{i:off,v:res},{i:n-1,v:res}],
             botLine:[{i:off,v:at(botLR,off)},{i:n-1,v:botNow}],
-            resistance:res, support:botNow }});
+            resistance:res, support:botNow,
+            topPivots:aResPivots, supPivots:aBotPivots,
+            topTouches:tPts.length, botTouches:bPts.length,
+            barsToApex:aBarsToApex, completionPct:aCompPct,
+            volContracting:aVolContracting }});
         break;
       }
       // Descending Triangle: clearly falling top + flat/near-flat bottom
       if (tFall&&(bFlat||(bSlope<FLAT*2))&&Math.abs(tSlope)>Math.abs(bSlope)*1.3) {
         const sup = bPts.reduce((mn,p)=>p.y<mn?p.y:mn, bPts[0].y);
+        // Require ≥2 bottom pivots within 2% of the support level —
+        // otherwise it's a single touch, not a valid horizontal support
+        const supTouches = bPts.filter(p => Math.abs(p.y - sup) / sup <= 0.02).length;
+        if (supTouches < 2) continue;
         const touchScore  = Math.min(1,(tPts.length+bPts.length-4)/4);
         const durationSc  = Math.min(1,(wLen-20)/30);
         const apexDist    = (topNow-botNow)/topNow;
         const apexSc      = Math.max(0, 1-apexDist*10);
         const dConf = Math.min(93, Math.round(62 + Math.abs(tSlope)*midP*200 + touchScore*10 + durationSc*8 + apexSc*5));
+        // ── Murphy apex bar: where declining top line meets flat support ──
+        const dApexX = tAS !== 0 ? tL.x + (sup - tL.y) / tAS : n + 30;
+        const dBarsToApex = Math.max(0, Math.round(dApexX - (n-1)));
+        const dCompletionPct = Math.round(Math.min(99, ((n-1-off) / Math.max(1, dApexX-off)) * 100));
+        // ── Volume contraction during pattern (Murphy Ch.7) ──
+        const dPatLen = n - 1 - off;
+        const dMidI   = off + Math.floor(dPatLen / 2);
+        const dEarlyVol = dPatLen >= 20 ? prices.slice(off, dMidI).reduce((a,p)=>a+p.volume,0) / Math.max(1, dMidI-off) : 0;
+        const dLateVol  = dPatLen >= 20 ? prices.slice(dMidI).reduce((a,p)=>a+p.volume,0)      / Math.max(1, n-1-dMidI) : 0;
+        const dVolContracting = dPatLen >= 20 && dLateVol < dEarlyVol * 0.88;
+        // Pivot touch points for rendering dots on the trendlines.
+        // Use the same bL / bR anchors that define the triangle — these are the actual
+        // lowest swing lows on each side of the midpoint, so the line touches both exactly.
+        // Add any other bPts whose actual price lands within 1% of the anchor line.
+        const anchorSlope = (bL.x !== bR.x) ? (bR.y - bL.y) / (bR.x - bL.x) : 0;
+        const lineAtBar   = (barI) => bL.y + anchorSlope * (barI - bL.x);
+        const dSupPivots  = bPts
+          .filter(p => Math.abs(p.y - lineAtBar(p.x)) / p.y <= 0.01)
+          .map(p=>({i:p.x, v:p.y}));
+        // Guarantee bL and bR are always included (they define the line)
+        if (!dSupPivots.find(p=>p.i===bL.x)) dSupPivots.unshift({i:bL.x, v:bL.y});
+        if (!dSupPivots.find(p=>p.i===bR.x)) dSupPivots.push({i:bR.x, v:bR.y});
+        dSupPivots.sort((a,b)=>a.i-b.i);
+        const dTopPivots = tPts.map(p=>({i:p.x,v:p.y}));
         found.push({ name:"Descending Triangle",
           conf: dConf,
           stage:last<sup*1.002?"Confirmed":"Forming",
           ...PATTERNS_DB["Descending Triangle"],
           geo:{ type:"triangle", startI:off,
-            topLine:[{i:off,v:at(topLR,off)},{i:n-1,v:topNow}],
-            botLine:[{i:off,v:sup},{i:n-1,v:sup}],
-            resistance:at(topLR,off), support:sup }});
+            topLine:[{i:tL.x,v:tL.y},{i:n-1,v:topNowA}],
+            botLine:[{i:bL.x,v:bL.y},{i:bR.x,v:bR.y}],
+            resistance:tL.y, support:sup,
+            topPivots:dTopPivots, supPivots:dSupPivots,
+            topTouches:tPts.length, botTouches:supTouches,
+            barsToApex:dBarsToApex, completionPct:dCompletionPct,
+            volContracting:dVolContracting }});
         break;
       }
       // Symmetrical Triangle: top falling + bottom rising (apex converging)
@@ -657,81 +748,158 @@ function detectPatterns(prices) {
           stage:"Forming",
           ...PATTERNS_DB["Symmetrical Triangle"],
           geo:{ type:"triangle", startI:off,
-            topLine:[{i:off,v:at(topLR,off)},{i:n-1,v:topNow}],
-            botLine:[{i:off,v:at(botLR,off)},{i:n-1,v:botNow}],
-            resistance:topNow, support:botNow }});
+            topLine:[{i:tL.x,v:tL.y},{i:n-1,v:topNowA}],
+            botLine:[{i:bL.x,v:bL.y},{i:n-1,v:botNowA}],
+            resistance:topNowA, support:botNowA }});
         break;
       }
-      // Rising Wedge: both lines rising, bottom steeper (bearish)
-      if (tRise&&bRise&&bSlope>tSlope*1.15) {
-        found.push({ name:"Wedge Rising", conf:68, stage:"Forming",
+      // Rising Wedge: both lines rising, bottom steeper (bearish) — Murphy p.173
+      // Requires: both rising, bottom clearly steeper, AND visible convergence (≥25% narrowing)
+      if (tRise && bRise && bSlope > tSlope * 1.3) {
+        if (Math.abs(bSlope) < SLOPE * 0.8) break; // bottom must be meaningfully rising
+        const rwLeftW  = Math.abs(tL.y - bL.y);
+        const rwRightW = Math.max(0, topNowA - botNowA);
+        if (rwLeftW < midP * 0.03) break;                        // too thin at left edge
+        if (rwRightW / Math.max(rwLeftW, 0.01) > 0.78) break;   // nearly parallel — not a wedge
+        const wConf = Math.min(80, Math.round(60 + (bSlope - tSlope) * midP * 150 + Math.min(1,(wLen-20)/30)*8));
+        found.push({ name:"Wedge Rising", conf:wConf, stage:"Forming",
           ...PATTERNS_DB["Wedge Rising"],
           geo:{ type:"triangle", startI:off,
-            topLine:[{i:off,v:at(topLR,off)},{i:n-1,v:topNow}],
-            botLine:[{i:off,v:at(botLR,off)},{i:n-1,v:botNow}],
-            resistance:topNow, support:botNow }});
+            topLine:[{i:tL.x,v:tL.y},{i:n-1,v:topNowA}],
+            botLine:[{i:bL.x,v:bL.y},{i:n-1,v:botNowA}],
+            resistance:topNowA, support:botNowA }});
         break;
       }
-      // Falling Wedge: both lines falling, top steeper (bullish)
-      if (tFall&&bFall&&Math.abs(tSlope)>Math.abs(bSlope)*1.15) {
-        found.push({ name:"Wedge Falling", conf:71, stage:"Forming",
+      // Falling Wedge: both lines falling, top steeper (bullish) — Murphy p.173
+      // Requires: both falling, top clearly steeper, AND visible convergence (≥25% narrowing)
+      // A flat bottom with falling top = descending triangle, not a wedge
+      if (tFall && bFall && Math.abs(tSlope) > Math.abs(bSlope) * 1.3) {
+        if (Math.abs(bSlope) < SLOPE * 0.8) break; // bottom must be meaningfully falling too
+        const fwLeftW  = Math.abs(tL.y - bL.y);
+        const fwRightW = Math.max(0, topNowA - botNowA);
+        if (fwLeftW < midP * 0.03) break;                        // too thin at left edge
+        if (fwRightW / Math.max(fwLeftW, 0.01) > 0.78) break;   // nearly parallel — not a wedge
+        const fwConf = Math.min(80, Math.round(60 + (Math.abs(tSlope) - Math.abs(bSlope)) * midP * 150 + Math.min(1,(wLen-20)/30)*8));
+        found.push({ name:"Wedge Falling", conf:fwConf, stage:"Forming",
           ...PATTERNS_DB["Wedge Falling"],
           geo:{ type:"triangle", startI:off,
-            topLine:[{i:off,v:at(topLR,off)},{i:n-1,v:topNow}],
-            botLine:[{i:off,v:at(botLR,off)},{i:n-1,v:botNow}],
-            resistance:topNow, support:botNow }});
+            topLine:[{i:tL.x,v:tL.y},{i:n-1,v:topNowA}],
+            botLine:[{i:bL.x,v:bL.y},{i:n-1,v:botNowA}],
+            resistance:topNowA, support:botNowA }});
         break;
       }
       break;
     }
 
     // ── 6. FLAGS — Murphy p.168 ───────────────────────────────────────────
-    // Pole: sharp directional move ≥3% in 5-15 bars.
-    // Flag: consolidation 5-20 bars, counter-trend slope, ≤38% retracement.
-    for (const pLen of [10,12,15,8]) {
-      if (n < pLen+8) continue;
-      const fLen = Math.min(18, n-pLen);
-      const pS = n-pLen-fLen, pE = n-fLen;
-      const poleGain = (closes[pE-1]-closes[pS]) / closes[pS];
-      const poleDrop = (closes[pS]-closes[pE-1]) / closes[pS];
-      const fCloses = closes.slice(pE), fHighs=highs.slice(pE), fLows=lows.slice(pE);
-      const fHi=safeMax(fHighs), fLo=safeMin(fLows);
-      const flagRange=(fHi-fLo)/fHi;
-      const fSlopeLR = linReg(fCloses.map((v,i)=>({x:i,y:v})));
-      const fSlope = fSlopeLR.slope / last;
+    // Detect the flag consolidation first, then walk backward to find the
+    // true pole origin rather than using a fixed-length lookback window.
+    // Pole: ≥5% move, ≥0.3%/bar sharpness. Flag: <7% range, ≤38% retrace.
+    {
+      let flagFound = false;
+      for (const fLen of [18,15,12,10,8]) {
+        if (flagFound || n < fLen+10) continue;
+        const pE = n - fLen;                                   // flag start bar
+        const fCloses=closes.slice(pE), fHighs=highs.slice(pE), fLows=lows.slice(pE);
+        const fHi=safeMax(fHighs), fLo=safeMin(fLows);
+        const flagRange=(fHi-fLo)/fHi;
+        if (flagRange >= 0.07) continue;                       // flag must be tight
 
-      if (poleGain >= 0.03 && flagRange < 0.07) {
-        const retrace = (fHi-fLo) / (closes[pE-1]-closes[pS]);
-        if (fSlope <= -0.0002 && retrace < 0.38) { // flag must slope DOWN (counter-trend), retrace <38%
+        const fSlopeLR = linReg(fCloses.map((v,i)=>({x:i,y:v})));
+        const fSlope   = fSlopeLR.slope / last;
+
+        // ── Bear Flag: flag slopes UP (counter-trend) ──────────────────────
+        // Must meaningfully slope upward AND start right after the pole bottom
+        if (fSlope >= 0.0005) {
+          // Step 1: pole bottom — lowest close in up to 50 bars before the flag
+          const preLen    = Math.min(50, pE);
+          const preSlice  = closes.slice(pE-preLen, pE);
+          const relBotI   = preSlice.reduce((mi,v,i)=>v<preSlice[mi]?i:mi, 0);
+          const botI      = pE-preLen+relBotI;
+          const botV      = closes[botI];
+          // ── CRITICAL: flag must start close to the pole bottom in both TIME and PRICE
+          if (pE - botI > Math.max(fLen, 10)) continue;  // must be within fLen bars of pole bottom
+          if (closes[pE] > botV * 1.08)        continue;  // flag start must be within 8% of pole bottom
+          // Step 2: pole origin — highest close in up to 90 bars before the bottom
+          const origLen   = Math.min(90, botI);
+          const origSlice = closes.slice(botI-origLen, botI);
+          if (!origSlice.length) continue;
+          const relOrigI  = origSlice.reduce((mi,v,i)=>v>origSlice[mi]?i:mi, 0);
+          const origI     = botI-origLen+relOrigI;
+          const origV     = closes[origI];
+
+          const poleDrop  = (origV-botV)/origV;
+          const poleBars  = botI-origI;
+          if (poleDrop  < 0.05)             continue;   // pole must be ≥5%
+          if (poleBars  < 3)                continue;
+          if (poleDrop/poleBars < 0.003)    continue;   // ≥0.3%/bar sharpness
+          const retrace = (fHi-fLo)/(origV-botV);
+          if (retrace >= 0.38)              continue;
+
           const tLR=linReg(fHighs.map((v,i)=>({x:pE+i,y:v})));
-          const bLR=linReg(fLows.map((v,i)=>({x:pE+i,y:v})));
-          found.push({ name:"Bull Flag",
-            conf:Math.min(91,Math.round(66+poleGain*110)),
-            stage:"Forming",
-            ...PATTERNS_DB["Bull Flag"],
-            geo:{ type:"flag", startI:pS,
-              poleBase:{i:pS,v:closes[pS]}, poleTop:{i:pE-1,v:closes[pE-1]},
-              flagTop:[{i:pE,v:at(tLR,pE)},{i:n-1,v:at(tLR,n-1)}],
-              flagBot:[{i:pE,v:at(bLR,pE)},{i:n-1,v:at(bLR,n-1)}],
-              resistance:at(tLR,n-1), support:at(bLR,n-1) }});
-          break;
-        }
-      }
-      if (poleDrop >= 0.03 && flagRange < 0.07) {
-        const retrace = (fHi-fLo) / (closes[pS]-closes[pE-1]);
-        if (fSlope >= 0.0002 && retrace < 0.38) { // flag must slope UP (counter-trend), retrace <38%
-          const tLR=linReg(fHighs.map((v,i)=>({x:pE+i,y:v})));
-          const bLR=linReg(fLows.map((v,i)=>({x:pE+i,y:v})));
+          const bLR=linReg(fLows.map((v,i) =>({x:pE+i,y:v})));
+          // Both channel lines must slope UPWARD — a downward-sloping channel is not a bear flag
+          // (it would be a descending channel or falling wedge instead)
+          if (tLR.slope <= 0 || bLR.slope <= 0) continue;
           found.push({ name:"Bear Flag",
             conf:Math.min(91,Math.round(66+poleDrop*110)),
             stage:"Forming",
             ...PATTERNS_DB["Bear Flag"],
-            geo:{ type:"flag", startI:pS,
-              poleBase:{i:pS,v:closes[pS]}, poleTop:{i:pE-1,v:closes[pE-1]},
+            geo:{ type:"flag", startI:origI,
+              poleBase:{i:origI,v:origV}, poleTop:{i:botI,v:botV},
+              recentLegV:closes[pE],               // price at flag start, used to cap target
               flagTop:[{i:pE,v:at(tLR,pE)},{i:n-1,v:at(tLR,n-1)}],
               flagBot:[{i:pE,v:at(bLR,pE)},{i:n-1,v:at(bLR,n-1)}],
               resistance:at(tLR,n-1), support:at(bLR,n-1) }});
-          break;
+          flagFound=true; break;
+        }
+
+        // ── Bull Flag: flag slopes DOWN (counter-trend) ────────────────────
+        // Murphy: flag must be a tight counter-trend pullback that starts RIGHT AFTER the pole top
+        if (fSlope <= -0.0005) {                        // must meaningfully slope down
+          // Step 1: pole top — highest close in up to 50 bars before the flag
+          const preLen    = Math.min(50, pE);
+          const preSlice  = closes.slice(pE-preLen, pE);
+          const relTopI   = preSlice.reduce((mi,v,i)=>v>preSlice[mi]?i:mi, 0);
+          const topI      = pE-preLen+relTopI;
+          const topV      = closes[topI];
+          // ── CRITICAL: flag must start close to the pole top in both TIME and PRICE ──
+          // If the flag starts far from the pole top, the real pullback already happened
+          // and what we're seeing is a recovery/new pattern, not the flag consolidation
+          if (pE - topI > Math.max(fLen, 10)) continue;  // must be within fLen bars of pole top
+          if (closes[pE] < topV * 0.92)        continue;  // flag start must be within 8% of pole top
+          // Step 2: pole origin — lowest close in up to 90 bars before the top
+          const origLen   = Math.min(90, topI);
+          const origSlice = closes.slice(topI-origLen, topI);
+          if (!origSlice.length) continue;
+          const relOrigI  = origSlice.reduce((mi,v,i)=>v<origSlice[mi]?i:mi, 0);
+          const origI     = topI-origLen+relOrigI;
+          const origV     = closes[origI];
+
+          const poleGain  = (topV-origV)/origV;
+          const poleBars  = topI-origI;
+          if (poleGain  < 0.05)             continue;   // pole must be ≥5%
+          if (poleBars  < 3)                continue;
+          if (poleGain/poleBars < 0.003)    continue;   // ≥0.3%/bar sharpness
+          const retrace = (fHi-fLo)/(topV-origV);
+          if (retrace >= 0.38)              continue;
+
+          const tLR=linReg(fHighs.map((v,i)=>({x:pE+i,y:v})));
+          const bLR=linReg(fLows.map((v,i) =>({x:pE+i,y:v})));
+          // Both channel lines must slope DOWNWARD — an upward-sloping channel is not a bull flag
+          // (it would be an ascending channel or rising wedge instead)
+          if (tLR.slope >= 0 || bLR.slope >= 0) continue;
+          found.push({ name:"Bull Flag",
+            conf:Math.min(91,Math.round(66+poleGain*110)),
+            stage:"Forming",
+            ...PATTERNS_DB["Bull Flag"],
+            geo:{ type:"flag", startI:origI,
+              poleBase:{i:origI,v:origV}, poleTop:{i:topI,v:topV},
+              recentLegV:closes[pE],               // price at flag start, used to cap target
+              flagTop:[{i:pE,v:at(tLR,pE)},{i:n-1,v:at(tLR,n-1)}],
+              flagBot:[{i:pE,v:at(bLR,pE)},{i:n-1,v:at(bLR,n-1)}],
+              resistance:at(tLR,n-1), support:at(bLR,n-1) }});
+          flagFound=true; break;
         }
       }
     }
@@ -762,23 +930,76 @@ function detectPatterns(prices) {
     }
 
     // ── 8. ROUNDING BOTTOM — Murphy p.131 ────────────────────────────────
-    for (const sl of [55,45]) {
-      if (n < sl) continue;
-      const seg=closes.slice(-sl), half=Math.floor(sl/2);
-      const lLR=linReg(seg.slice(0,half).map((v,i)=>({x:i,y:v})));
-      const rLR=linReg(seg.slice(half).map((v,i)=>({x:i,y:v})));
-      const botV=safeMin(seg.slice(half-6,half+6));
-      const botIdx=n-sl+half-6+seg.slice(half-6,half+6).indexOf(botV);
-      if (lLR.slope<-0.02&&rLR.slope>0.02&&botV<Math.min(seg[0],seg[sl-1])*0.96) {
-        const res=Math.max(seg[0],seg[sl-1]);
-        found.push({ name:"Rounding Bottom", conf:78,
-          stage:last>res*0.98?"Confirmed":"Forming",
-          ...PATTERNS_DB["Rounding Bottom"],
-          geo:{ type:"cup", startI:n-sl,
-            points:[{i:n-sl,v:seg[0],label:"Start"},{i:botIdx,v:botV,label:"Bottom"},{i:n-1,v:seg[sl-1],label:"Now"}],
-            resistance:res, support:botV }});
-        break;
+    // Murphy: a slow, gradual "saucer" taking months to form. NOT a V-bottom
+    // or short consolidation bounce. Strict filters:
+    //   (1) ≥65 bars (~3 months)   (2) smooth U-curve (low jaggedness score)
+    //   (3) depth ≥8%              (4) left/right slope symmetry ≥30%
+    //   (5) volume U-profile (trough volume < edge volume)
+    for (const sl of [80, 70, 65]) {
+      if (n < sl + 5) continue;
+      const seg  = closes.slice(-sl);
+      const half = Math.floor(sl / 2);
+      const lLR  = linReg(seg.slice(0, half).map((v,i) => ({x:i, y:v})));
+      const rLR  = linReg(seg.slice(half).map((v,i) => ({x:i, y:v})));
+
+      // Direction gate: left must be clearly falling, right clearly rising
+      if (!(lLR.slope < -0.03 && rLR.slope > 0.03)) continue;
+
+      // Locate the trough in the centre quarter
+      const tW  = Math.min(8, Math.floor(half * 0.4));
+      const tLo = Math.max(0, half - tW), tHi = Math.min(sl, half + tW);
+      const troughSeg = seg.slice(tLo, tHi);
+      const botV   = safeMin(troughSeg);
+      const botIdx = n - sl + tLo + troughSeg.indexOf(botV);
+
+      // (3) Depth ≥ 8%: bottom must sit well below both ends — filters bounce/V
+      const edgeAvg = (seg[0] + seg[sl-1]) / 2;
+      const depth   = (edgeAvg - botV) / edgeAvg;
+      if (depth < 0.08) continue;
+
+      // (4) Symmetry: descent and ascent speeds within 35% of each other
+      //    A lopsided saucer (crash then drift) is not a rounding bottom
+      const lSpeed  = Math.abs(lLR.slope);
+      const rSpeed  = Math.abs(rLR.slope);
+      const symRatio = lSpeed > 0 && rSpeed > 0
+        ? Math.min(lSpeed, rSpeed) / Math.max(lSpeed, rSpeed) : 0;
+      if (symRatio < 0.30) continue;
+
+      // (2) Smoothness: each close vs its 5-bar local average
+      //    High deviation = jagged bounce, not a saucer
+      let totalDev = 0, devCount = 0;
+      for (let i = 2; i < sl - 2; i++) {
+        const loc = (seg[i-2]+seg[i-1]+seg[i]+seg[i+1]+seg[i+2]) / 5;
+        totalDev += Math.abs(seg[i] - loc) / loc;
+        devCount++;
       }
+      const smoothScore = devCount > 0 ? totalDev / devCount : 1;
+      if (smoothScore > 0.025) continue;   // >2.5% jaggedness → not a saucer
+
+      // (5) Volume U-shape: trough volume < edge volumes (Murphy Ch.7)
+      const vols     = prices.slice(-sl).map(p => p.volume);
+      const qLen     = Math.floor(sl / 4);
+      const lVolAvg  = vols.slice(0, qLen).reduce((a,b)=>a+b, 0) / qLen;
+      const midVols  = vols.slice(Math.floor(sl*0.35), Math.ceil(sl*0.65));
+      const midVolAvg = midVols.reduce((a,b)=>a+b, 0) / Math.max(1, midVols.length);
+      const rVolAvg  = vols.slice(-qLen).reduce((a,b)=>a+b, 0) / qLen;
+      const volUShaped = midVolAvg < lVolAvg * 0.85 && midVolAvg < rVolAvg * 0.85;
+
+      const res  = Math.max(seg[0], seg[sl-1]);
+      const conf = Math.min(91, Math.round(
+        68 + depth * 70 + symRatio * 8 + (volUShaped ? 6 : 0) + (smoothScore < 0.015 ? 5 : 0)
+      ));
+      found.push({ name:"Rounding Bottom", conf,
+        stage: last > res * 0.98 ? "Confirmed" : "Forming",
+        ...PATTERNS_DB["Rounding Bottom"],
+        geo:{ type:"cup", startI: n - sl,
+          points:[
+            {i:n-sl,   v:seg[0],    label:"Start"},
+            {i:botIdx, v:botV,      label:"Bottom"},
+            {i:n-1,    v:seg[sl-1], label:"Now"}],
+          resistance: res, support: botV,
+          volUShaped, smoothPct: (smoothScore*100).toFixed(1), symPct: Math.round(symRatio*100) }});
+      break;
     }
 
     // ── 9. RECTANGLE — Murphy p.150 ──────────────────────────────────────
@@ -912,7 +1133,13 @@ function calcBulkowskiTarget(pattern, currentPrice) {
     if (geo.type === "flag") {
       const poleBase = geo.poleBase?.v, poleTop = geo.poleTop?.v;
       if (!poleBase || !poleTop) return null;
-      const poleHeight = Math.abs(poleTop - poleBase);     // length of the pole
+      const fullPoleHeight = Math.abs(poleTop - poleBase);
+      // Cap pole height at the immediate pre-flag leg to keep targets realistic
+      // when the pole origin is a large historical move (e.g. a multi-month decline).
+      const recentLeg = geo.recentLegV != null
+        ? Math.abs(geo.recentLegV - (pattern.breakout==="bearish" ? poleTop : poleBase))
+        : fullPoleHeight;
+      const poleHeight = Math.min(fullPoleHeight, recentLeg);
       const flagBreakout = pattern.breakout === "bullish"
         ? (geo.flagTop ? geo.flagTop[1].v : poleTop)       // top of flag channel
         : (geo.flagBot ? geo.flagBot[1].v : poleTop);      // bottom of flag channel
@@ -959,12 +1186,29 @@ function calcBulkowskiTarget(pattern, currentPrice) {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // PATTERN INVALIDATION — per-pattern geometric rules (Murphy & Bulkowski)
-// Returns { invalidated: bool, reason: string }
+// Returns { invalidated: bool, reason: string, isBusted?: bool, bustedTarget?: number }
 // ══════════════════════════════════════════════════════════════════════════════
+// KEY FIX: for patterns where the invalidation is a close below/above a fixed
+// level (double bottom/top, cup, rect), we scan ALL historical closes within
+// the pattern window — not just today's price. A stock can break below support
+// in March, bounce back to current price, and the pattern is still invalidated.
 function checkPatternInvalidation(pattern, prices, currentPrice) {
   if (!pattern?.geo) return { invalidated:false, reason:"" };
-  const geo=pattern.geo, last=currentPrice;
+  const geo=pattern.geo, last=currentPrice, n=prices.length;
+
+  // ── Helper: find first bar after `fromBar` where predicate(close) is true ──
+  const firstViolation = (fromBar, predFn) => {
+    for (let i=Math.max(0,fromBar); i<n; i++) {
+      if (predFn(prices[i].close)) return { bar:i, price:prices[i].close, ts:prices[i].ts };
+    }
+    return null;
+  };
+  const fmtDate = (ts) => ts ? new Date(ts).toLocaleDateString("en-US",{month:"short",day:"numeric"}) : "";
+
   if (geo.type==="triangle") {
+    // Triangles: check current price only (trendlines shift every bar — historical
+    // closes need to be evaluated against the trendline value at that bar, which
+    // is complex. Current price vs current trendline endpoint is sufficient.)
     const topNow=geo.topLine?.[1]?.v, botNow=geo.botLine?.[1]?.v;
     if (topNow==null||botNow==null) return { invalidated:false, reason:"" };
     if (pattern.breakout==="bearish"&&last>topNow*1.005)
@@ -974,35 +1218,73 @@ function checkPatternInvalidation(pattern, prices, currentPrice) {
     if (pattern.breakout==="neutral"&&(last>topNow*1.005||last<botNow*0.995))
       return { invalidated:true, reason:`Price broke symmetrical triangle bounds — monitor breakout direction` };
   }
+
   if (geo.type==="doubleBottom") {
-    if (geo.support&&last<geo.support*0.97) return { invalidated:true, reason:`Price broke below double bottom support ($${geo.support.toFixed(2)})` };
+    const support=geo.support, neckline=geo.resistance;
+    if (support) {
+      // Scan closes from AFTER the second low (p2) to now.
+      // Murphy: any close below the support level (the two lows) invalidates.
+      // Using 0.5% tolerance to avoid flagging on tiny precision gaps.
+      const p2Bar = geo.points?.[2]?.i ?? geo.startI;
+      const v = firstViolation(p2Bar + 1, c => c < support * 0.995);
+      if (v) {
+        // Bulkowski busted pattern: target = support − (neckline − support)
+        const height = neckline ? neckline - support : support * 0.10;
+        const bustedTarget = support - height;
+        return { invalidated:true, isBusted:true, bustedTarget,
+          reason:`Closed below double bottom lows ($${support.toFixed(2)}) on ${fmtDate(v.ts)} — BUSTED PATTERN (Bulkowski: ~35%+ downside move expected)` };
+      }
+    }
   }
+
   if (geo.type==="doubleTop") {
-    if (geo.resistance&&last>geo.resistance*1.03) return { invalidated:true, reason:`Price broke above double top resistance ($${geo.resistance.toFixed(2)})` };
+    const resistance=geo.resistance, neckline=geo.support;
+    if (resistance) {
+      const p2Bar = geo.points?.[2]?.i ?? geo.startI;
+      const v = firstViolation(p2Bar + 1, c => c > resistance * 1.005);
+      if (v) {
+        const height = neckline ? resistance - neckline : resistance * 0.10;
+        const bustedTarget = resistance + height;
+        return { invalidated:true, isBusted:true, bustedTarget,
+          reason:`Closed above double top highs ($${resistance.toFixed(2)}) on ${fmtDate(v.ts)} — BUSTED PATTERN (Bulkowski: ~35%+ upside move expected)` };
+      }
+    }
   }
+
   if (geo.type==="hs") {
     const headPrice=geo.points?.[1]?.v, rShoulder=geo.points?.[2]?.v;
     if (headPrice&&last>headPrice*1.005) return { invalidated:true, reason:`Price exceeded head ($${headPrice.toFixed(2)}) — H&S negated` };
     if (rShoulder&&last>rShoulder*1.02)  return { invalidated:true, reason:`Price closed above right shoulder ($${rShoulder.toFixed(2)})` };
   }
+
   if (geo.type==="ihs") {
     const headPrice=geo.points?.[1]?.v;
     if (headPrice&&last<headPrice*0.995) return { invalidated:true, reason:`Price fell below head ($${headPrice.toFixed(2)}) — IH&S negated` };
   }
+
   if (geo.type==="flag") {
     const pb=geo.poleBase?.v;
     if (pb&&pattern.breakout==="bullish"&&last<pb*0.97) return { invalidated:true, reason:`Price undercut pole base ($${pb.toFixed(2)}) — bull flag failed` };
     if (pb&&pattern.breakout==="bearish"&&last>pb*1.03) return { invalidated:true, reason:`Price exceeded pole base ($${pb.toFixed(2)}) — bear flag failed` };
   }
+
   if (geo.type==="cup") {
-    if (geo.support&&last<geo.support*0.97) return { invalidated:true, reason:`Price broke below cup bottom ($${geo.support.toFixed(2)})` };
+    // Scan full pattern window for any close below the cup bottom
+    const v = firstViolation(geo.startI, c => c < geo.support * 0.995);
+    if (v) return { invalidated:true, reason:`Closed below cup bottom ($${geo.support.toFixed(2)}) on ${fmtDate(v.ts)} — pattern failed` };
   }
+
   if (geo.type==="rect") {
-    if (pattern.breakout==="bullish"&&geo.support&&last<geo.support*0.97)
-      return { invalidated:true, reason:`Price broke below rectangle support ($${geo.support.toFixed(2)})` };
-    if (pattern.breakout==="bearish"&&geo.resistance&&last>geo.resistance*1.03)
-      return { invalidated:true, reason:`Price broke above rectangle resistance ($${geo.resistance.toFixed(2)})` };
+    if (pattern.breakout==="bullish"&&geo.support) {
+      const v = firstViolation(geo.startI, c => c < geo.support * 0.97);
+      if (v) return { invalidated:true, reason:`Closed below rectangle support ($${geo.support.toFixed(2)}) on ${fmtDate(v.ts)}` };
+    }
+    if (pattern.breakout==="bearish"&&geo.resistance) {
+      const v = firstViolation(geo.startI, c => c > geo.resistance * 1.03);
+      if (v) return { invalidated:true, reason:`Closed above rectangle resistance ($${geo.resistance.toFixed(2)}) on ${fmtDate(v.ts)}` };
+    }
   }
+
   return { invalidated:false, reason:"" };
 }
 
@@ -1259,18 +1541,65 @@ function PatternOverlay({ geo, pattern, toX, toY, W, H, pad, prices }) {
   if (geo.type==="triangle") {
     const tl=geo.topLine, bl=geo.botLine;
     if (tl&&bl) {
-      const leftEdgeX=px(tl[0]), leftTopY=py(tl[0]), leftBotY=py(bl[0]);
-      const rightEdgeX=px(tl[1]), rightTopY=py(tl[1]), rightBotY=py(bl[1]);
-      const polyPts=`${leftEdgeX},${leftTopY} ${rightEdgeX},${rightTopY} ${rightEdgeX},${rightBotY} ${leftEdgeX},${leftBotY}`;
+      const leftEdgeX=px(tl[0]), leftTopY=py(tl[0]);
+      const rightEdgeX=px(tl[1]), rightTopY=py(tl[1]);
+      // Interpolate exact y-value ON a two-point line at a given bar index
+      const lineY = (line, barI) => {
+        if (!line) return null;
+        const [p0, p1] = line;
+        if (p1.i === p0.i) return p0.v;
+        return p0.v + (p1.v - p0.v) * (barI - p0.i) / (p1.i - p0.i);
+      };
+      // Top pivot dots — snap to top trendline
+      const topPivotDots=(geo.topPivots||[]).map((p,i)=>{
+        const v = lineY(tl, p.i); if (v===null) return null;
+        const cx=toX(clampI(p.i)), cy=toY(v);
+        return <circle key={`tp${i}`} cx={cx} cy={cy} r="4.5" fill={dirColor} fillOpacity="0.6" stroke="#0a1428" strokeWidth="1.2"/>;
+      });
+      // ── Bottom trendline: straight line anchored at actual first & last pivot lows ──
+      const supPivots = geo.supPivots || [];
+      let botLineEl, botDotsEl;
+      let leftBotV, rightBotV; // price values at pattern left/right edges
+      if (supPivots.length >= 2) {
+        // Anchor: first pivot → last pivot defines slope; extend to pattern edges
+        const sp0 = supPivots[0], spN = supPivots[supPivots.length - 1];
+        const spSlope = (spN.v - sp0.v) / Math.max(spN.i - sp0.i, 1);
+        const spAt = (barI) => sp0.v + spSlope * (barI - sp0.i);
+        leftBotV  = spAt(tl[0].i);
+        rightBotV = spAt(tl[1].i);
+        const lby = toY(leftBotV), rby = toY(rightBotV);
+        botLineEl = <line key="bl" x1={leftEdgeX} y1={lby} x2={rightEdgeX} y2={rby} stroke={dirColor} strokeWidth="2.5" opacity="0.9"/>;
+        // Dots snap to the straight line at each pivot's bar position
+        botDotsEl = supPivots.map((p,i)=>{
+          const v = spAt(p.i);
+          return <circle key={`bp${i}`} cx={toX(clampI(p.i))} cy={toY(v)} r="4.5" fill={dirColor} fillOpacity="0.6" stroke="#0a1428" strokeWidth="1.2"/>;
+        });
+      } else {
+        // Fallback: use bl endpoints as-is
+        leftBotV  = bl[0].v;
+        rightBotV = bl[1].v;
+        const lby = py(bl[0]), rby = py(bl[1]);
+        botLineEl = <line key="bl" x1={leftEdgeX} y1={lby} x2={rightEdgeX} y2={rby} stroke={dirColor} strokeWidth="2.5" opacity="0.9"/>;
+        botDotsEl = <>
+          <circle cx={leftEdgeX}  cy={lby} r="4" fill={dirColor} fillOpacity="0.4" stroke={dirColor} strokeWidth="1.5"/>
+          <circle cx={rightEdgeX} cy={rby} r="3" fill={dirColor} fillOpacity="0.7"/>
+        </>;
+      }
+      const leftBotY  = toY(leftBotV);
+      const rightBotY = toY(rightBotV);
+      const polyPts = `${leftEdgeX},${leftTopY} ${rightEdgeX},${rightTopY} ${rightEdgeX},${rightBotY} ${leftEdgeX},${leftBotY}`;
       body=<>
         <polygon points={polyPts} fill={dirColor} fillOpacity="0.07" stroke="none"/>
         <line x1={leftEdgeX} y1={leftTopY} x2={rightEdgeX} y2={rightTopY} stroke={dirColor} strokeWidth="2.5" opacity="0.9"/>
-        <line x1={leftEdgeX} y1={leftBotY} x2={rightEdgeX} y2={rightBotY} stroke={dirColor} strokeWidth="2.5" opacity="0.9"/>
+        {botLineEl}
         <line x1={leftEdgeX} y1={leftTopY} x2={leftEdgeX} y2={leftBotY} stroke={dirColor} strokeWidth="1.5" strokeDasharray="4,3" opacity="0.55"/>
-        <circle cx={leftEdgeX}  cy={leftTopY}  r="4" fill={dirColor} fillOpacity="0.4" stroke={dirColor} strokeWidth="1.5"/>
-        <circle cx={leftEdgeX}  cy={leftBotY}  r="4" fill={dirColor} fillOpacity="0.4" stroke={dirColor} strokeWidth="1.5"/>
-        <circle cx={rightEdgeX} cy={rightTopY} r="3" fill={dirColor} fillOpacity="0.7"/>
-        <circle cx={rightEdgeX} cy={rightBotY} r="3" fill={dirColor} fillOpacity="0.7"/>
+        {/* Pivot touch dots on top trendline */}
+        {topPivotDots.length>0 ? topPivotDots : <>
+          <circle cx={leftEdgeX}  cy={leftTopY}  r="4" fill={dirColor} fillOpacity="0.4" stroke={dirColor} strokeWidth="1.5"/>
+          <circle cx={rightEdgeX} cy={rightTopY} r="3" fill={dirColor} fillOpacity="0.7"/>
+        </>}
+        {/* Pivot touch dots on bottom trendline — at actual low prices */}
+        {botDotsEl}
       </>;
     }
   }
@@ -1435,6 +1764,19 @@ function BigChart({ prices, symbol, quote, pattern, targetPrice, targetBreakout 
             <g>
               <line x1={pad.l} y1={bY} x2={W-pad.r} y2={bY} stroke={bColor} strokeWidth="1" strokeDasharray="3,4" opacity="0.6"/>
               <text x={pad.l+4} y={bY-3} fill={bColor} fontSize="8" fontFamily="monospace" opacity="0.8">BKT</text>
+            </g>
+          );
+        })()}
+        {/* 3% Murphy confirmation filter (Murphy Ch.4) — close beyond this = real breakout */}
+        {targetBreakout && targetBreakout > 0 && pattern?.breakout !== "neutral" && (() => {
+          const confirmLevel = pattern?.breakout === "bearish" ? targetBreakout * 0.97 : targetBreakout * 1.03;
+          const inRange = confirmLevel >= min && confirmLevel <= max;
+          if (!inRange) return null;
+          const cY = toY(confirmLevel);
+          return (
+            <g>
+              <line x1={pad.l} y1={cY} x2={W-pad.r} y2={cY} stroke="#ff8800" strokeWidth="0.9" strokeDasharray="2,5" opacity="0.55"/>
+              <text x={pad.l+5} y={cY-3} fill="#ff8800" fontSize="7" fontFamily="monospace" opacity="0.8">3% CONFIRM</text>
             </g>
           );
         })()}
@@ -3695,6 +4037,1271 @@ function BottomFinderTab({ mono }) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// ELLIOTT WAVE ANALYSIS — Frost & Prechter + Glenn Neely methodology
+// 3 Hard Rules: (1) W2 never retraces >100% of W1, (2) W3 never the shortest,
+// (3) W4 never overlaps W1 territory. Fibonacci scoring for quality ranking.
+// ══════════════════════════════════════════════════════════════════════════════
+function detectElliottWave(prices) {
+  if (!prices || prices.length < 40) return null;
+  const n = prices.length;
+  const closes = prices.map(p=>p.close);
+  const highs  = prices.map(p=>p.high);
+  const lows   = prices.map(p=>p.low);
+  const last   = closes[n-1];
+
+  // ── Pivot detection (5-bar window) ────────────────────────────────────────
+  const pHigh=[], pLow=[];
+  for (let i=5; i<n-5; i++) {
+    let isH=true, isL=true;
+    for (let j=i-5; j<=i+5; j++) {
+      if (j===i) continue;
+      if (highs[j]>=highs[i]) isH=false;
+      if (lows[j] <=lows[i])  isL=false;
+    }
+    if (isH) pHigh.push({i, v:highs[i],  type:'H'});
+    if (isL) pLow.push( {i, v:lows[i],   type:'L'});
+  }
+
+  // Merge into strictly alternating sequence (keep stronger pivot of same type)
+  const all = [...pHigh,...pLow].sort((a,b)=>a.i-b.i);
+  const alt = [];
+  for (const p of all) {
+    const prev = alt[alt.length-1];
+    if (!prev || prev.type!==p.type) { alt.push(p); }
+    else if ((p.type==='H'&&p.v>prev.v)||(p.type==='L'&&p.v<prev.v)) alt[alt.length-1]=p;
+  }
+
+  // ── Fibonacci proximity scorer (within 12% of level = partial credit) ─────
+  const fibProx = (ratio, levels) => {
+    let best=Infinity;
+    for (const lv of levels) { const e=Math.abs(ratio-lv)/lv; if(e<best) best=e; }
+    return Math.max(0, 1-best/0.12);
+  };
+
+  // ── Validate & score one 6-point candidate ────────────────────────────────
+  const tryCount = (pts) => {
+    const isBull = pts[1].v > pts[0].v;
+    const [v0,v1,v2,v3,v4,v5] = pts.map(p=>p.v);
+
+    // Direction checks
+    if (isBull  && (v1<=v0||v2>=v1||v3<=v2||v4>=v3||v5<=v4)) return null;
+    if (!isBull && (v1>=v0||v2<=v1||v3>=v2||v4<=v3||v5>=v4)) return null;
+
+    const L1=Math.abs(v1-v0), L2=Math.abs(v2-v1), L3=Math.abs(v3-v2),
+          L4=Math.abs(v4-v3), L5=Math.abs(v5-v4);
+    const w2ret=L2/L1, w3ext=L3/L1, w4ret=L4/L3, w5eq1=L5/L1;
+    const span13=Math.abs(v3-v0), w5of13=L5/(span13||1);
+
+    // ── 3 Hard Rules (Frost & Prechter) ─────────────────────────────────────
+    if (w2ret>=1.0)                 return null; // R1: W2 ≤ 100% of W1
+    if (L3<L1 && L3<L5)            return null; // R2: W3 not shortest
+    if (isBull  && v4<=v1)         return null; // R3: W4/W1 no overlap
+    if (!isBull && v4>=v1)         return null;
+
+    // ── Fibonacci scoring ────────────────────────────────────────────────────
+    let sc = 0;
+    sc += fibProx(w2ret, [0.382,0.500,0.618,0.786])     * 28; // W2 retrace
+    sc += fibProx(w3ext, [1.618,2.000,2.618])            * 32; // W3 extension
+    sc += fibProx(w4ret, [0.236,0.382,0.500])            * 20; // W4 retrace
+    sc += Math.max(fibProx(w5eq1,[0.618,1.000,1.618])*18,
+                   fibProx(w5of13,[0.382,0.618])     *13);     // W5 target
+    if (w2ret>0.50 && w4ret<0.382) sc+=8;                     // alternation
+    if (L3>=L1 && L3>=L5)         sc+=6;                      // W3 longest
+    const bars=pts[5].i-pts[0].i;
+    if (bars<20) sc-=10;
+    sc+=Math.min(5,bars/20);
+
+    return { isBull, pts, sc, w2ret, w3ext, w4ret, w5eq1, L1, L3, L5, span13 };
+  };
+
+  // ── Search all 6-point windows ────────────────────────────────────────────
+  let best=null, bestSc=-1;
+  for (let s=0; s<=alt.length-6; s++) {
+    const pts=alt.slice(s,s+6);
+    const isBull=pts[1].v>pts[0].v;
+    // Verify correct H-L alternation for trend
+    const ok = isBull
+      ? pts[0].type==='L'&&pts[1].type==='H'&&pts[2].type==='L'&&pts[3].type==='H'&&pts[4].type==='L'&&pts[5].type==='H'
+      : pts[0].type==='H'&&pts[1].type==='L'&&pts[2].type==='H'&&pts[3].type==='L'&&pts[4].type==='H'&&pts[5].type==='L';
+    if (!ok) continue;
+    const r=tryCount(pts);
+    if (r && r.sc>bestSc) { bestSc=r.sc; best=r; }
+  }
+  if (!best || bestSc<8) return null;
+
+  // ── Post-process: extend W5 to true price extreme ────────────────────────
+  // The 5-bar pivot window can miss the actual W5 high if a later bar exceeds
+  // the identified pivot without itself qualifying as a 5-bar pivot.
+  // Two stop conditions:
+  //   1. Price breaks back through the W4 level (hard Elliott Wave rule violation)
+  //   2. Close drops below midpoint of W4→runningPeak range (correction has begun)
+  //      This prevents scanning through an ABC correction and picking up a
+  //      post-correction recovery as a "new W5 high".
+  {
+    const { pts: bPts, isBull: bBull } = best;
+    const w4vExt = bPts[4].v;
+    let extI = bPts[5].i, extV = bPts[5].v;
+    let runPeakV = extV; // tracks the highest high seen so far
+    for (let i = bPts[4].i + 1; i < n - 4; i++) {
+      if (bBull  && lows[i]  < w4vExt) break;  // W4-level break
+      if (!bBull && highs[i] > w4vExt) break;
+      // Update running peak if new extreme found
+      if (bBull  && highs[i] > runPeakV) { runPeakV = highs[i]; extV = highs[i]; extI = i; }
+      if (!bBull && lows[i]  < runPeakV) { runPeakV = lows[i];  extV = lows[i];  extI = i; }
+      // Stop if close crosses the W4–peak midpoint: signals a real correction started
+      const mid = (w4vExt + runPeakV) / 2;
+      if (bBull  && closes[i] < mid) break;
+      if (!bBull && closes[i] > mid) break;
+    }
+    if (extI !== bPts[5].i) {
+      const newPts = [...bPts];
+      newPts[5] = { i: extI, v: extV, type: bBull ? 'H' : 'L' };
+      best = { ...best, pts: newPts, L5: Math.abs(extV - bPts[4].v) };
+    }
+  }
+
+  // ── Current wave position ─────────────────────────────────────────────────
+  const {pts,isBull,L1} = best;
+  const w4v=pts[4].v, w5v=pts[5].v;
+
+  // Detect if W5 has already peaked and reversed even if current close < w5v.
+  // Two signals: (a) W5 bar itself was a large rejection candle (close >4% below
+  // bull high / above bear low), or (b) W5 bar is ≥5 bars in the past AND
+  // current price has pulled back >3% from the W5 extreme.
+  const w5BarClose  = closes[Math.min(pts[5].i, n-1)];
+  const barsAfterW5 = (n-1) - pts[5].i;
+  const w5Rejection = isBull
+    ? w5BarClose < w5v * 0.96          // bearish rejection: closed >4% below W5 high
+    : w5BarClose > w5v * 1.04;         // bullish rejection: closed >4% above W5 low
+  const w5LongPullback = barsAfterW5 >= 5 && (
+    isBull  ? last < w5v * 0.97        // 5+ bars later, still >3% below peak
+            : last > w5v * 1.03
+  );
+  const w5PastPeak = w5Rejection || w5LongPullback;
+
+  let currentWave, waveStatus;
+  if (isBull) {
+    if (last>=w5v)                          { currentWave=5; waveStatus='complete'; }
+    else if (last>=w4v && w5PastPeak)       { currentWave=5; waveStatus='complete'; }
+    else if (last>=w4v)                     { currentWave=5; waveStatus='forming';  }
+    else                                    { currentWave=4; waveStatus='late';     }
+  } else {
+    if (last<=w5v)                          { currentWave=5; waveStatus='complete'; }
+    else if (last<=w4v && w5PastPeak)       { currentWave=5; waveStatus='complete'; }
+    else if (last<=w4v)                     { currentWave=5; waveStatus='forming';  }
+    else                                    { currentWave=4; waveStatus='late';     }
+  }
+
+  // ── W5 projections from W4 end ────────────────────────────────────────────
+  const dir = isBull ? 1 : -1;
+  const projections = {
+    fib618:  w4v + dir*L1*0.618,
+    fib100:  w4v + dir*L1,
+    fib1618: w4v + dir*L1*1.618,
+  };
+
+  return { ...best, score:Math.min(100,Math.round(bestSc)), currentWave, waveStatus, projections };
+}
+
+// ── Weekly resampler (5-bar grouping proxy for weekly bars) ──────────────────
+function resampleWeekly(prices) {
+  if (!prices || prices.length === 0) return prices;
+  const weeks = [];
+  let cur = null, dayCount = 0, wIdx = 0;
+  prices.forEach((p, i) => {
+    const w = Math.floor(i / 5);
+    if (cur === null || w !== wIdx) {
+      if (cur) weeks.push(cur);
+      wIdx = w;
+      cur = { open: p.open||p.close, high: p.high||p.close, low: p.low||p.close, close: p.close, volume: p.volume||0, date: p.date };
+    } else {
+      cur.high   = Math.max(cur.high,  p.high||p.close);
+      cur.low    = Math.min(cur.low,   p.low||p.close);
+      cur.close  = p.close;
+      cur.volume += (p.volume||0);
+    }
+  });
+  if (cur) weeks.push(cur);
+  return weeks;
+}
+
+// ── ABC corrective pattern detector ──────────────────────────────────────────
+function detectABCCorrection(prices, wave) {
+  if (!wave || !prices || prices.length < 10) return null;
+  const n = prices.length;
+  const highs = prices.map(p => p.high  || p.close);
+  const lows  = prices.map(p => p.low   || p.close);
+  const w5End = wave.pts[5].i;
+  if (w5End >= n - 3) return null;
+
+  const isBull  = wave.isBull;
+  const w5Price = wave.pts[5].v;
+
+  // Find alternating pivots after W5 using a tighter 3-bar window
+  const pHigh = [], pLow = [];
+  const win = 3;
+  for (let i = w5End + win; i < n - win; i++) {
+    let isH = true, isL = true;
+    for (let j = i - win; j <= i + win; j++) {
+      if (j === i) continue;
+      if (highs[j] >= highs[i]) isH = false;
+      if (lows[j]  <= lows[i])  isL = false;
+    }
+    if (isH) pHigh.push({ i, v: highs[i], type: 'H' });
+    if (isL) pLow.push(  { i, v: lows[i],  type: 'L' });
+  }
+
+  const all = [...pHigh, ...pLow].sort((a, b) => a.i - b.i);
+  const alt = [];
+  for (const p of all) {
+    const prev = alt[alt.length - 1];
+    if (!prev || prev.type !== p.type) alt.push(p);
+    else if ((p.type==='H' && p.v>prev.v)||(p.type==='L' && p.v<prev.v)) alt[alt.length-1] = p;
+  }
+
+  if (alt.length < 1) return null;
+
+  // A leg: first pivot moving opposite to impulse direction
+  let aIdx = -1;
+  for (let k = 0; k < alt.length; k++) {
+    if (isBull && alt[k].type === 'L') { aIdx = k; break; }
+    if (!isBull && alt[k].type === 'H') { aIdx = k; break; }
+  }
+  if (aIdx < 0) return null;
+
+  const origin = { i: w5End, v: w5Price };
+  const ptA = alt[aIdx];
+  const ptB = aIdx + 1 < alt.length ? alt[aIdx + 1] : null;
+  const ptC = aIdx + 2 < alt.length ? alt[aIdx + 2] : null;
+
+  const LA = Math.abs(ptA.v - w5Price);
+  if (LA < 0.01) return null;
+  const LB = ptB ? Math.abs(ptB.v - ptA.v) : null;
+  const LC = ptC ? Math.abs(ptC.v - (ptB?.v ?? ptA.v)) : null;
+
+  const bRet = (LB != null && LA) ? LB / LA : null;
+  const cEqA = (LC != null && LA) ? LC / LA : null;
+
+  // Quality score
+  let sc = 10;
+  if (bRet != null) {
+    const bErr = Math.min(...[0.382, 0.500, 0.618].map(t => Math.abs(bRet - t) / t));
+    sc += Math.max(0, (1 - bErr / 0.20) * 35);
+  }
+  if (cEqA != null) {
+    const cErr = Math.min(...[0.618, 1.000, 1.618].map(t => Math.abs(cEqA - t) / t));
+    sc += Math.max(0, (1 - cErr / 0.20) * 35);
+    sc += 20;
+  } else if (ptB) sc += 15;
+
+  // C-wave price targets measured from B
+  const dir = isBull ? -1 : 1;
+  const cTargets = ptB ? {
+    fib618:  ptB.v + dir * LA * 0.618,
+    fib100:  ptB.v + dir * LA,
+    fib1618: ptB.v + dir * LA * 1.618,
+  } : null;
+
+  return {
+    origin, ptA, ptB, ptC,
+    LA, LB, LC, bRet, cEqA,
+    score:    Math.min(100, Math.round(sc)),
+    isBull,
+    complete: !!ptC,
+    cTargets,
+  };
+}
+
+// ── Elliott Wave Chart (SVG candlesticks + wave overlays + ABC) ───────────────
+function ElliottChart({ prices, wave, abc=null, width=680, height=290 }) {
+  if (!prices||!wave) return null;
+  const pad={l:52,r:90,t:20,b:44}; // wide right margin for target labels; extra bottom for date axis
+  const W=width, H=height;
+  const n=prices.length;
+  const closes=prices.map(p=>p.close);
+  const curClose=closes[n-1];
+
+  // ── History slice ─────────────────────────────────────────────────────────
+  const startI=Math.max(0,wave.pts[0].i-5);
+  const slice=prices.slice(startI);
+  const slLen=slice.length;
+
+  // ── Future projection zone (22% of history width) ────────────────────────
+  const futureLen=Math.max(8, Math.round(slLen*0.22));
+  const totalLen=slLen+futureLen; // total x-axis slots
+
+  // ── Collect all values for Y range ───────────────────────────────────────
+  const allVals=[
+    ...slice.map(p=>p.high||p.close),
+    ...slice.map(p=>p.low||p.close),
+  ].filter(isFinite);
+
+  // Include active W5 targets
+  const proj=wave.projections;
+  // Don't show W5 targets if wave is complete OR if ABC has already started
+  // (ABC starting = W5 reversed without hitting target — projections are stale)
+  const showW5=(proj && wave.waveStatus!=='complete' && !abc?.ptA);
+  if (showW5) Object.values(proj).forEach(v=>{if(isFinite(v))allVals.push(v);});
+
+  // Include ABC points & C targets
+  if (abc) {
+    [abc.origin,abc.ptA,abc.ptB,abc.ptC].forEach(pt=>{if(pt&&isFinite(pt.v))allVals.push(pt.v);});
+    if(abc.cTargets) Object.values(abc.cTargets).forEach(v=>{if(isFinite(v))allVals.push(v);});
+  }
+
+  const lo=Math.min(...allVals)*0.993, hi=Math.max(...allVals)*1.007;
+  const chartW=W-pad.l-pad.r;
+  const chartH=H-pad.t-pad.b;
+
+  // toX maps slot index across total (history + future) slots
+  const toX=i=>pad.l+(i/(totalLen-1||1))*chartW;
+  const toY=v=>H-pad.b-((v-lo)/(hi-lo||1))*chartH;
+  const pi=i=>Math.max(0,i-startI);
+
+  // X where "now" is (last candle)
+  const nowX=toX(slLen-1);
+  // X at the far edge of the future zone
+  const futX=toX(totalLen-1);
+
+  // ── Future zone shading ───────────────────────────────────────────────────
+  const futureShade=(
+    <rect x={nowX} y={pad.t} width={futX-nowX} height={chartH}
+      fill="#00d4ff" fillOpacity="0.03"/>
+  );
+  // Vertical "now" divider
+  const nowLine=(
+    <line x1={nowX} y1={pad.t} x2={nowX} y2={H-pad.b}
+      stroke="#00d4ff" strokeWidth="0.6" strokeDasharray="3,4" opacity="0.35"/>
+  );
+
+  // ── Candlesticks ──────────────────────────────────────────────────────────
+  const cw=Math.max(1.5,Math.min(7,chartW/totalLen*0.65));
+  const candles=slice.map((bar,idx)=>{
+    const x=toX(idx);
+    const o=toY(bar.open||bar.close), c=toY(bar.close);
+    const h=toY(bar.high||bar.close), l=toY(bar.low||bar.close);
+    const up=(bar.close>=(bar.open||bar.close));
+    const bodyTop=Math.min(o,c), bodyH=Math.max(1,Math.abs(o-c));
+    return (
+      <g key={idx}>
+        <line x1={x} y1={h} x2={x} y2={l} stroke={up?'#00cc66':'#cc3344'} strokeWidth="0.8" opacity="0.65"/>
+        <rect x={x-cw/2} y={bodyTop} width={cw} height={bodyH}
+          fill={up?'#1a4a2a':'#4a1a22'} stroke={up?'#00cc66':'#cc3344'} strokeWidth="0.5"/>
+      </g>
+    );
+  });
+
+  // ── Wave segments ─────────────────────────────────────────────────────────
+  const wc=['#ffdd00','#ff6644','#00ff88','#ff9900','#00ccff'];
+  const isFormingW5 = wave.waveStatus === 'forming';
+  const segs=wave.pts.slice(0,5).map((p,idx)=>{
+    const p2=wave.pts[idx+1];
+    // W4→W5 (idx=4): when forming, draw dashed to current close so the
+    // segment stays anchored to real price data rather than floating above it
+    const lastSeg = idx === 4 && isFormingW5;
+    const endI = lastSeg ? slLen-1 : pi(p2.i);
+    const endV = lastSeg ? curClose : p2.v;
+    return <line key={idx}
+      x1={toX(pi(p.i))} y1={toY(p.v)}
+      x2={toX(endI)} y2={toY(endV)}
+      stroke={wc[idx]}
+      strokeWidth={lastSeg ? 1.6 : 2.2}
+      strokeDasharray={lastSeg ? '6,3' : undefined}
+      opacity="0.9"/>;
+  });
+
+  // Wave number badges
+  const dots=wave.pts.slice(1).map((p,idx)=>{
+    // W5 badge (idx=4): when forming, pin to current close so it sits on the
+    // last real candle, not above it or past the "now" divider
+    const formingBadge = idx === 4 && isFormingW5;
+    const x = formingBadge ? toX(slLen-1) : toX(pi(p.i));
+    const y = formingBadge ? toY(curClose) : toY(p.v);
+    return (
+      <g key={idx}>
+        <circle cx={x} cy={y} r="10" fill={wc[idx]} opacity="0.18"/>
+        <circle cx={x} cy={y} r="7"  fill="#0a1428" stroke={wc[idx]} strokeWidth="1.5"/>
+        <text x={x} y={y+4} textAnchor="middle" fill={wc[idx]} fontSize="9" fontWeight="bold">{idx+1}</text>
+      </g>
+    );
+  });
+
+  // ── Helper: draw a forward projection ray ─────────────────────────────────
+  // Draws from (anchorX, anchorPrice) → (targetX, targetPrice) + label box
+  const projRay=(key, anchorX, anchorPrice, targetPrice, targetX, col, label, shortLabel)=>{
+    const y1=toY(anchorPrice), y2=toY(targetPrice);
+    if (!isFinite(y1)||!isFinite(y2)) return null;
+    const clampedY2=Math.max(pad.t+4, Math.min(H-pad.b-4, y2));
+    const labelVal=targetPrice>=1000?`$${targetPrice.toFixed(0)}`:`$${targetPrice.toFixed(2)}`;
+    const pct=((targetPrice-curClose)/curClose*100);
+    const pctTxt=`${pct>=0?'+':''}${pct.toFixed(1)}%`;
+    return (
+      <g key={key}>
+        {/* Fan line from anchor to target */}
+        <line x1={anchorX} y1={y1} x2={targetX} y2={clampedY2}
+          stroke={col} strokeWidth="1.1" strokeDasharray="5,3" opacity="0.75"/>
+        {/* Horizontal tick at target */}
+        <line x1={targetX-4} y1={clampedY2} x2={targetX+2} y2={clampedY2}
+          stroke={col} strokeWidth="1.5" opacity="0.9"/>
+        {/* Label box on right margin */}
+        <rect x={targetX+4} y={clampedY2-8} width={pad.r-8} height={16}
+          fill="#070e1c" stroke={col} strokeWidth="0.7" rx="2" opacity="0.92"/>
+        <text x={targetX+8} y={clampedY2-1} fill={col} fontSize="7.5" fontWeight="bold">{labelVal}</text>
+        <text x={targetX+8} y={clampedY2+7} fill={col} fontSize="6.5" opacity="0.75">{shortLabel} {pctTxt}</text>
+      </g>
+    );
+  };
+
+  // ── Active-target filter: only show targets still AHEAD of current price ─────
+  // bull impulse → targets must be above curClose; bear → below; corrections flip
+  const isAheadW5 = v => wave.isBull ? v > curClose : v < curClose;
+  const isAheadC  = v => abc?.isBull ? v < curClose : v > curClose; // correction reverses direction
+
+  // Hide W5 projections if: wave is complete OR abc correction has already started
+  // (abc.ptA existing means W5 already reversed — target was never hit or already passed)
+
+  // ── W5 projected targets (fan from W4 end) ────────────────────────────────
+  const w4Idx=pi(wave.pts[4].i);
+  const w4Price=wave.pts[4].v;
+  const w4X=toX(w4Idx);
+  // Collect only active targets, then assign staggered x positions
+  const activeW5=(showW5?[
+    {v:proj.fib618,  col:'#3a8a5a', label:'W5 61.8%', short:'61.8%'},
+    {v:proj.fib100,  col:'#00ff88', label:'W5 100%',  short:'100%'},
+    {v:proj.fib1618, col:'#00ffcc', label:'W5 161.8%',short:'161.8%'},
+  ].filter(t=>isFinite(t.v)&&isAheadW5(t.v)):[]);
+  const tSlots=[0.55,0.75,0.95];
+  const w5Rays=activeW5.map((t,i)=>
+    projRay('w5'+i, w4X, w4Price, t.v,
+      toX(slLen-1+futureLen*(tSlots[i]??0.95)), t.col, t.label, t.short)
+  ).filter(Boolean);
+
+  // ── ABC overlay ───────────────────────────────────────────────────────────
+  const abcPts=[abc?.origin,abc?.ptA,abc?.ptB,abc?.ptC].filter(Boolean);
+  const abcLabels=['','A','B','C'];
+  const abcCol={A:'#dd66ff',B:'#ffcc44',C:'#ff44aa'};
+  const abcSegs=abcPts.slice(0,abcPts.length-1).map((p,i)=>{
+    const p2=abcPts[i+1];
+    const col=abcCol[abcLabels[i+1]]||'#dd66ff';
+    return <line key={'as'+i}
+      x1={toX(pi(p.i))} y1={toY(p.v)} x2={toX(pi(p2.i))} y2={toY(p2.v)}
+      stroke={col} strokeWidth="2" strokeDasharray="5,3" opacity="0.85"/>;
+  });
+  const abcDots=abcPts.slice(1).map((p,i)=>{
+    const col=abcCol[abcLabels[i+1]]||'#dd66ff';
+    const x=toX(pi(p.i)), y=toY(p.v);
+    return (
+      <g key={'ad'+i}>
+        <circle cx={x} cy={y} r="8" fill="#0a1428" stroke={col} strokeWidth="1.5"/>
+        <text x={x} y={y+4} textAnchor="middle" fill={col} fontSize="9" fontWeight="bold">{abcLabels[i+1]}</text>
+      </g>
+    );
+  });
+
+  // ── ABC C-wave projected targets (active only, fan from B end) ────────────
+  const cRays=(!abc?.ptC && abc?.cTargets && abc?.ptB)?(()=>{
+    const bIdx=pi(abc.ptB.i);
+    const bX=toX(bIdx);
+    const bP=abc.ptB.v;
+    const activeCT=[
+      {v:abc.cTargets.fib618,  col:'#aa44cc', label:'C 61.8%', short:'61.8%'},
+      {v:abc.cTargets.fib100,  col:'#dd66ff', label:'C = A',   short:'=A'},
+      {v:abc.cTargets.fib1618, col:'#ffaaff', label:'C 161.8%',short:'161.8%'},
+    ].filter(t=>isFinite(t.v)&&isAheadC(t.v));
+    return activeCT.map((t,i)=>
+      projRay('c'+i, bX, bP, t.v,
+        toX(slLen-1+futureLen*(tSlots[i]??0.95)), t.col, t.label, t.short)
+    ).filter(Boolean);
+  })():[];
+
+  // ── Grid & axes ───────────────────────────────────────────────────────────
+  const ticks=5;
+  const grid=Array.from({length:ticks+1},(_,i)=>{
+    const y=toY(lo+(hi-lo)*i/ticks);
+    return <line key={i} x1={pad.l} y1={y} x2={W-pad.r} y2={y} stroke="#0d1f35" strokeWidth="0.5"/>;
+  });
+  const yLabels=Array.from({length:ticks+1},(_,i)=>{
+    const v=lo+(hi-lo)*i/ticks;
+    return <text key={i} x={pad.l-3} y={toY(v)+4} textAnchor="end" fill="#2a4a6a" fontSize="8">
+      {v>=1000?`$${v.toFixed(0)}`:`$${v.toFixed(2)}`}
+    </text>;
+  });
+  // ── X-axis: month/year labels with vertical tick lines ───────────────────
+  const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const fmtDate=(bar,idx)=>{
+    // Prices use bar.ts = Unix ms timestamp
+    const ms = bar?.ts ?? bar?.date;
+    if (!ms || isNaN(Number(ms))) return `+${idx}`;
+    const d = new Date(Number(ms));
+    return `${MONTHS[d.getMonth()]} '${String(d.getFullYear()).slice(2)}`;
+  };
+  const xTicks=Math.min(7,slLen);
+  const xAxisItems=Array.from({length:xTicks},(_,i)=>{
+    const idx=Math.round(i*(slLen-1)/(xTicks-1||1));
+    const bar=slice[idx];
+    const label=fmtDate(bar,idx);
+    const x=toX(idx);
+    return { idx, label, x };
+  });
+  // Deduplicate by label so the same month doesn't appear twice
+  const seen=new Set();
+  const xLabels=xAxisItems.filter(({label})=>{
+    if(seen.has(label)){return false;} seen.add(label); return true;
+  }).map(({label,x,idx})=>(
+    <g key={idx}>
+      {/* Vertical tick line */}
+      <line x1={x} y1={H-pad.b} x2={x} y2={H-pad.b+4} stroke="#2a4a6a" strokeWidth="1"/>
+      {/* Month label */}
+      <text x={x} y={H-pad.b+13} textAnchor="middle" fill="#3a6a9a" fontSize="8" fontWeight="bold">{label}</text>
+    </g>
+  ));
+  // Light vertical grid lines at each date tick (inside chart area)
+  const xGridLines=xAxisItems.map(({x,idx})=>(
+    <line key={'xg'+idx} x1={x} y1={pad.t} x2={x} y2={H-pad.b}
+      stroke="#0d1f35" strokeWidth="0.5" strokeDasharray="2,4"/>
+  ));
+
+  // ── Current price hairline ────────────────────────────────────────────────
+  const curY=toY(curClose);
+
+  return (
+    <svg width={W} height={H} style={{background:'#070e1c',borderRadius:'2px'}}>
+      {/* Clip path so candles don't bleed into label margin */}
+      <defs>
+        <clipPath id="chartClip">
+          <rect x={pad.l} y={pad.t} width={chartW} height={chartH}/>
+        </clipPath>
+      </defs>
+      {grid}
+      {xGridLines}
+      {yLabels}
+      {xLabels}
+      {/* Future zone */}
+      {futureShade}
+      {nowLine}
+      <text x={nowX+3} y={pad.t+9} fill="#00d4ff" fontSize="7" opacity="0.4">PROJECTED</text>
+      {/* History candles (clipped) */}
+      <g clipPath="url(#chartClip)">{candles}</g>
+      {/* Wave overlays (clipped to chart area for segments, dots may spill slightly) */}
+      <g clipPath="url(#chartClip)">{segs}</g>
+      <circle cx={toX(pi(wave.pts[0].i))} cy={toY(wave.pts[0].v)} r="5" fill="#2a4a6a" stroke="#4a7a9a" strokeWidth="1"/>
+      {dots}
+      {/* ABC history */}
+      <g clipPath="url(#chartClip)">{abcSegs}</g>
+      {abcDots}
+      {/* Projection rays (intentionally outside clip — extend into right margin) */}
+      {w5Rays}
+      {cRays}
+      {/* Current price */}
+      <line x1={pad.l} y1={curY} x2={W-pad.r} y2={curY} stroke="#00d4ff" strokeWidth="0.8" strokeDasharray="3,3" opacity="0.6"/>
+      <rect x={pad.l} y={curY-7} width={52} height={13} fill="#0a1c30" stroke="#00d4ff" strokeWidth="0.7" rx="2"/>
+      <text x={pad.l+4} y={curY+4} fill="#00d4ff" fontSize="8.5" fontWeight="bold">${curClose.toFixed(2)}</text>
+    </svg>
+  );
+}
+
+// ── Elliott Wave Tab Component ─────────────────────────────────────────────
+function ElliottWaveTab({ stocks, selected, setSelected, mono }) {
+  const [ewSel,  setEwSel]  = useState(selected||null);
+  const [tf,     setTf]     = useState('daily'); // 'daily' | 'weekly'
+
+  // Produce resampled prices + wave for the chosen timeframe
+  const getEffective = useCallback((s) => {
+    if (!s) return { prices: null, wave: null };
+    if (tf === 'daily') return { prices: s.prices, wave: s.elliottWave };
+    const prices = resampleWeekly(s.prices);
+    const wave   = (() => { try { return detectElliottWave(prices); } catch { return null; } })();
+    return { prices, wave };
+  }, [tf]);
+
+  // Build stock list filtered to those with a valid wave count
+  const waveStocks = useMemo(() => stocks
+    .map(s => ({ s, ...getEffective(s) }))
+    .filter(({ wave }) => !!wave)
+    .sort((a,b) => (b.wave.score||0) - (a.wave.score||0)),
+  [stocks, getEffective]);
+
+  const selEntry  = waveStocks.find(e=>e.s.sym===ewSel) || waveStocks[0] || null;
+  const selStock  = selEntry?.s || null;
+  const effPrices = selEntry?.prices || null;
+  const ew        = selEntry?.wave   || null;
+
+  // ABC detection on effective (possibly weekly) prices
+  const abc = useMemo(() => {
+    if (!selStock || !effPrices || !ew) return null;
+    try { return detectABCCorrection(effPrices, ew); } catch { return null; }
+  }, [selStock, effPrices, ew]);
+
+  const waveColor = w => w===1?'#ffdd00':w===2?'#ff6644':w===3?'#00ff88':w===4?'#ff9900':'#00ccff';
+  const waveLabel = (w,st) =>
+    w===5&&st==='complete'?'5 — COMPLETE':w===5&&st==='forming'?'5 — FORMING':w===4&&st==='late'?'4 — LATE':`${w}`;
+  const fibPct = r => r!=null?`${(r*100).toFixed(1)}%`:'—';
+
+  return (
+    <div style={{display:'flex',height:'calc(100vh - 96px)',fontFamily:mono}}>
+
+      {/* ── Left: stock list + timeframe ── */}
+      <div style={{width:'224px',borderRight:'1px solid #1a3050',overflowY:'auto',flexShrink:0}}>
+        <div style={{padding:'8px 12px',background:'#080f1c',borderBottom:'1px solid #1a3050',fontSize:'9px',color:'#3a5a7a',letterSpacing:'2px'}}>
+          ELLIOTT WAVE SCAN — {waveStocks.length} COUNTS
+        </div>
+
+        {/* Timeframe toggle */}
+        <div style={{display:'flex',gap:'0',borderBottom:'1px solid #1a3050'}}>
+          {['daily','weekly'].map(t=>(
+            <button key={t} onClick={()=>setTf(t)}
+              style={{flex:1,padding:'6px 4px',fontSize:'9px',letterSpacing:'1px',cursor:'pointer',border:'none',
+                background:tf===t?'#0d2040':'#060c18',
+                color:tf===t?'#00d4ff':'#2a4a6a',
+                borderBottom:tf===t?'2px solid #00d4ff':'2px solid transparent',
+                textTransform:'uppercase'}}>
+              {t}
+            </button>
+          ))}
+        </div>
+
+        {waveStocks.length===0&&(
+          <div style={{padding:'20px',textAlign:'center',color:'#1a3050',fontSize:'10px'}}>
+            No valid {tf} wave counts.<br/>Run RESCAN first.
+          </div>
+        )}
+        {waveStocks.map(({s,wave:sw})=>{
+          const isSel=s.sym===ewSel||(s.sym===selStock?.sym&&!ewSel);
+          const wc=waveColor(sw.currentWave);
+          return (
+            <div key={s.sym} onClick={()=>setEwSel(s.sym)}
+              style={{padding:'8px 12px',borderBottom:'1px solid #0d1828',cursor:'pointer',
+                background:isSel?'#0d2040':'transparent',
+                borderLeft:isSel?'3px solid #00d4ff':'3px solid transparent'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <span style={{color:'#e0f0ff',fontWeight:'bold',fontSize:'12px'}}>{s.sym}</span>
+                <span style={{background:wc+'22',color:wc,padding:'2px 6px',fontSize:'9px',borderRadius:'2px'}}>W{sw.currentWave}</span>
+              </div>
+              <div style={{display:'flex',justifyContent:'space-between',marginTop:'3px'}}>
+                <span style={{fontSize:'9px',color:sw.isBull?'#00ff88':'#ff4466'}}>{sw.isBull?'▲ BULL':'▼ BEAR'}</span>
+                <span style={{fontSize:'9px',color:'#3a5a7a'}}>Score {sw.score}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* ── Right: detail panel ── */}
+      <div style={{flex:1,overflowY:'auto',padding:'16px',display:'flex',flexDirection:'column',gap:'12px'}}>
+        {!selStock&&(
+          <div style={{textAlign:'center',color:'#1a3050',paddingTop:'60px',fontSize:'11px'}}>Select a stock to view wave analysis</div>
+        )}
+        {selStock&&ew&&(
+          <>
+            {/* ── Header ── */}
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+              <div>
+                <div style={{display:'flex',alignItems:'center',gap:'10px'}}>
+                  <span style={{fontSize:'18px',color:'#e0f0ff',fontWeight:'bold'}}>{selStock.sym}</span>
+                  <span style={{fontSize:'9px',color:'#1a3a6a',background:'#0d1f3c',padding:'2px 8px',letterSpacing:'1px'}}>
+                    {tf.toUpperCase()}
+                  </span>
+                </div>
+                <div style={{fontSize:'10px',color:'#3a5a7a',marginTop:'2px'}}>{selStock.quote?.name||''}</div>
+                <div style={{marginTop:'6px',display:'flex',gap:'8px',alignItems:'center'}}>
+                  <span style={{color:ew.isBull?'#00ff88':'#ff4466',fontSize:'11px',fontWeight:'bold'}}>
+                    {ew.isBull?'▲ BULLISH IMPULSE':'▼ BEARISH IMPULSE'}
+                  </span>
+                  <span style={{fontSize:'9px',color:'#2a4a6a',background:'#0d1f3c',padding:'2px 8px'}}>Frost & Prechter Ch.2</span>
+                </div>
+              </div>
+              <div style={{textAlign:'right'}}>
+                <div style={{fontSize:'22px',color:'#00d4ff',fontWeight:'bold'}}>${selStock.quote?.price?.toFixed(2)||'—'}</div>
+                <div style={{marginTop:'4px',background:waveColor(abc?.ptA?5:ew.currentWave)+'22',border:`1px solid ${waveColor(abc?.ptA?5:ew.currentWave)}44`,
+                  padding:'4px 10px',color:waveColor(abc?.ptA?5:ew.currentWave),fontSize:'11px',textAlign:'center'}}>
+                  WAVE {abc?.ptA ? '5 — COMPLETE' : waveLabel(ew.currentWave,ew.waveStatus)}
+                </div>
+                {abc&&(
+                  <div style={{marginTop:'4px',background:'#3a1a4a44',border:'1px solid #dd66ff44',
+                    padding:'3px 10px',color:'#dd66ff',fontSize:'9px',textAlign:'center'}}>
+                    ABC {abc.complete?'COMPLETE':'FORMING'} · {abc.score}pts
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* ── 6-Step Objective Roadmap ── */}
+            {(()=>{
+              const w=ew.currentWave, st=ew.waveStatus, bull=ew.isBull;
+              const curP=selStock.quote?.price||effPrices[effPrices.length-1]?.close||0;
+              const dir=bull?'LONG':'SHORT', opp=bull?'SHORT':'LONG';
+              const up=bull?'↑':'↓', dn=bull?'↓':'↑';
+              const fmt=v=>v>=1000?`$${v.toFixed(0)}`:`$${v.toFixed(2)}`;
+
+              // Determine active step (1–6) based on wave position
+              let activeStep=1;
+              if (abc&&abc.ptB&&!abc.ptC)        activeStep=6; // in C leg
+              else if (abc&&abc.ptA&&!abc.ptB)   activeStep=6; // in B leg (still ABC phase)
+              else if (abc&&!abc.ptA)             activeStep=6; // A starting
+              else if (w===5&&st==='complete')    activeStep=5;
+              else if (w===5&&st==='forming')     activeStep=4;
+              else if (w===4)                     activeStep=3;
+              else if (w===3)                     activeStep=2;
+              else                                activeStep=1;
+
+              // Pre-compute key prices
+              const w3Target=fmt(ew.pts[2].v+(ew.L1*1.618*(bull?1:-1)));
+              const w3Max   =fmt(ew.pts[2].v+(ew.L1*2.618*(bull?1:-1)));
+              const stopW1  =fmt(ew.pts[0].v);
+              const stopW2  =fmt(ew.pts[2].v);
+              const stopW4  =fmt(ew.pts[4].v);
+              const w4entry =fmt(ew.pts[4].v);
+              const ahead=v=>bull?v>curP:v<curP;
+              const aheadC=v=>bull?v<curP:v>curP;
+              const activeW5=[
+                {v:ew.projections.fib618,l:'61.8%'},
+                {v:ew.projections.fib100,l:'100%'},
+                {v:ew.projections.fib1618,l:'161.8%'},
+              ].filter(t=>isFinite(t.v)&&ahead(t.v));
+              const w5tgt=abc?.ptA?'W5 complete — ABC correction now active'
+                :activeW5.length?activeW5.map(t=>`${fmt(t.v)} (${t.l})`).join(' · ')
+                :'All W5 targets reached';
+              const activeCT=abc?.cTargets?[
+                {v:abc.cTargets.fib618,l:'61.8%'},
+                {v:abc.cTargets.fib100,l:'=A'},
+                {v:abc.cTargets.fib1618,l:'161.8%'},
+              ].filter(t=>isFinite(t.v)&&aheadC(t.v)):[];
+              const ctgt=activeCT.length?activeCT.map(t=>`${fmt(t.v)} (${t.l})`).join(' · '):'Awaiting B pivot';
+
+              // Pattern confluence
+              const pat    = selStock.pattern;
+              const rsi    = selStock.rsi||50;
+              const divB   = selStock.divergence?.bullDiv;
+              const divBear= selStock.divergence?.bearDiv;
+              const volTrend=selStock.volData?.trend||1;
+              const patBull = pat?.breakout==='bullish';
+              const patBear = pat?.breakout==='bearish';
+              const confirmed=pat?.stage==='Confirmed';
+              const forming  =pat?.stage==='Forming';
+              const invalidated=pat?.stage==='Invalidated';
+
+              // Classify the wave context
+              const inImpulseBull= bull && (w===1||w===3||(w===5&&st==='forming'));
+              const inImpulseBear=!bull && (w===1||w===3||(w===5&&st==='forming'));
+              const inCorrectBull= bull && (w===2||w===4);
+              const inCorrectBear=!bull && (w===2||w===4);
+              const inABC        = abc && !abc.complete;
+              const exhausted    = (w===5&&st==='complete')||abc?.complete;
+
+              // Score confluence: +points = confirms, -points = conflicts
+              let cfScore=0, cfNotes=[];
+
+              // Pattern direction vs wave direction
+              if (patBull && inImpulseBull)  { cfScore+=3; cfNotes.push(`${pat.name} (${pat.stage}) aligns with ${bull?'bullish':'bearish'} wave 3/5 impulse`); }
+              if (patBear && inImpulseBear)  { cfScore+=3; cfNotes.push(`${pat.name} (${pat.stage}) aligns with bearish impulse`); }
+              if (patBull && inCorrectBull)  { cfScore+=2; cfNotes.push(`${pat.name} signals reversal — supports wave ${w} bottom and wave ${w+1} launch`); }
+              if (patBear && inCorrectBear)  { cfScore+=2; cfNotes.push(`${pat.name} signals reversal — supports wave ${w} top and wave ${w+1} decline`); }
+              if (patBull && (inImpulseBear||inCorrectBear||exhausted&&bull)) { cfScore-=2; cfNotes.push(`${pat.name} is bullish but wave context is bearish — conflicting signals`); }
+              if (patBear && (inImpulseBull||inCorrectBull||exhausted&&!bull)) { cfScore-=2; cfNotes.push(`${pat.name} is bearish but wave context is bullish — conflicting signals`); }
+              if (patBull && exhausted&&!bull) { cfScore+=2; cfNotes.push(`${pat.name} supports ABC correction bottom — potential new impulse forming`); }
+              if (patBear && exhausted&& bull) { cfScore+=2; cfNotes.push(`${pat.name} confirms exhaustion — ABC correction setup`); }
+              if (invalidated)               { cfScore-=1; cfNotes.push(`Pattern invalidated — reduces confluence weight`); }
+              if (confirmed)                 { cfScore+=1; cfNotes.push(`Pattern confirmed breakout — adds conviction`); }
+
+              // RSI confluence
+              if (bull && (w===2||w===4) && rsi<40) { cfScore+=1; cfNotes.push(`RSI ${rsi.toFixed(0)} oversold — confirms corrective wave bottom`); }
+              if (!bull && (w===2||w===4) && rsi>60) { cfScore+=1; cfNotes.push(`RSI ${rsi.toFixed(0)} overbought — confirms corrective wave top`); }
+              if ((w===5||exhausted) && bull && rsi>70){ cfScore+=1; cfNotes.push(`RSI ${rsi.toFixed(0)} overbought at wave 5 — divergence warning`); }
+              if ((w===5||exhausted) && !bull && rsi<30){ cfScore+=1; cfNotes.push(`RSI ${rsi.toFixed(0)} oversold at wave 5 — divergence warning`); }
+
+              // Divergence confluence
+              if (divB && (inCorrectBull||(w===2)||(w===4))) { cfScore+=2; cfNotes.push(`Bullish RSI divergence — strong wave 2/4 bottom signal`); }
+              if (divBear && (inCorrectBear||(exhausted&&bull))) { cfScore+=2; cfNotes.push(`Bearish RSI divergence — confirms wave 5 exhaustion`); }
+              if (divB && exhausted && !bull) { cfScore+=2; cfNotes.push(`Bullish divergence at ABC C — signals corrective bottom`); }
+
+              // Volume
+              if (inImpulseBull && volTrend>1.3) { cfScore+=1; cfNotes.push(`Volume surge ${volTrend.toFixed(1)}x — confirms impulse momentum`); }
+              if (inCorrectBull && volTrend<0.9)  { cfScore+=1; cfNotes.push(`Volume drying up — healthy corrective wave characteristic`); }
+
+              // Determine confluence label and color
+              const cfLabel = cfScore>=4?'STRONG CONFIRMS':cfScore>=2?'CONFIRMS':cfScore===1?'SLIGHT EDGE':cfScore===0?'NEUTRAL':cfScore===-1?'CAUTION':'CONFLICTS';
+              const cfColor = cfScore>=4?'#00ff88':cfScore>=2?'#66dd88':cfScore===1?'#aabb44':cfScore===0?'#4a6a8a':cfScore===-1?'#ffaa00':'#ff4466';
+              const cfBg    = cfScore>=2?'#001808':cfScore===0?'#080f1c':cfScore<=-2?'#180800':'#0f1000';
+              const topNote = cfNotes[0]||`${pat?.name||'No pattern'} — no direct confluence with current wave position`;
+
+              // ── Wave objective ───────────────────────────────────────────
+              let obj=null;
+              if (abc&&!abc.complete&&abc.ptB&&!abc.ptC) {
+                obj={phase:`C LEG — CORRECTIVE THRUST ${dn}`,accent:'#ff44aa',bg:'#1a0812',border:'#ff44aa',badge:'ABC·C',
+                  primary:`Mirror the A leg ${bull?'down':'up'} — C typically equals A in length`,
+                  entry:`Enter ${opp} on B-wave breakdown. Stop above B pivot ($${abc.ptB.v.toFixed(2)}).`,
+                  target:(()=>{const curP=selStock.quote?.price||0;const ct=abc.cTargets||{};const aheadC=v=>abc.isBull?v<curP:v>curP;return[{v:ct.fib618,l:'61.8%'},{v:ct.fib100,l:'=A'},{v:ct.fib1618,l:'161.8%'}].filter(t=>t.v&&aheadC(t.v)).map(t=>`$${t.v.toFixed(2)} (${t.l})`).join(' · ')||'All C targets reached';})(),
+                  invalid:`Invalidated if price closes back above B pivot ($${abc.ptB.v.toFixed(2)})`};
+              } else if (abc&&!abc.complete&&abc.ptA&&!abc.ptB) {
+                obj={phase:`B WAVE — COUNTER-RALLY TRAP ${up}`,accent:'#ffcc44',bg:'#1a1508',border:'#ffcc44',badge:'ABC·B',
+                  primary:`B is a counter-trend bounce — do NOT chase it as a new impulse`,
+                  entry:`Fade the B rally near 50–78.6% retrace of A. Prepare ${opp} entry for C leg.`,
+                  target:`B likely stalls near $${(abc.ptA.v+(abc.origin.v-abc.ptA.v)*0.618).toFixed(2)} (61.8% retrace of A)`,
+                  invalid:`If B exceeds wave 5 extreme ($${ew.pts[5].v.toFixed(2)}), possible flat — reassess count`};
+              } else if (w===5&&st==='complete') {
+                obj={phase:`WAVE 5 COMPLETE — REVERSAL ZONE ${dn}`,accent:'#ff9900',bg:'#1a1000',border:'#ff9900',badge:'W5 DONE',
+                  primary:`Full 5-wave impulse exhausted — major ABC correction is the next sequence`,
+                  entry:`Close all ${dir} positions. Confirm divergence before initiating ${opp}.`,
+                  target:`ABC correction expected to retrace 38.2–61.8% of entire ${bull?'rally':'decline'}`,
+                  invalid:`New ${bull?'high':'low'} beyond wave 5 = extended wave scenario — rare`};
+              } else if (w===5&&st==='forming') {
+                obj={phase:`WAVE 5 FORMING — FINAL PUSH ${up}`,accent:'#00ccff',bg:'#041018',border:'#00ccff',badge:'WAVE 5',
+                  primary:`Last leg of the impulse — profitable but carries divergence risk`,
+                  entry:`Trail stop from wave 4 ($${ew.pts[4].v.toFixed(2)}). Reduce size vs. wave 3.`,
+                  target:(()=>{const curP=selStock.quote?.price||0;const ahead=v=>ew.isBull?v>curP:v<curP;return[{v:ew.projections.fib618,l:'min'},{v:ew.projections.fib100,l:'typical'},{v:ew.projections.fib1618,l:'extended'}].filter(t=>ahead(t.v)).map(t=>`$${t.v.toFixed(2)} (${t.l})`).join(' · ')||'All targets reached';})(),
+                  invalid:`Close below wave 4 ($${ew.pts[4].v.toFixed(2)}) — wave 3 may be terminal`};
+              } else if (w===4) {
+                obj={phase:`WAVE 4 PULLBACK — RE-ENTRY SETUP ${dn}`,accent:'#ff9900',bg:'#120c00',border:'#ff9900',badge:'WAVE 4',
+                  primary:`Corrective pullback — opportunity to add ${dir} for wave 5 launch`,
+                  entry:`Enter ${dir} on reversal at 23.6–38.2% retrace of wave 3. Stop below wave 1 top ($${ew.pts[1].v.toFixed(2)}).`,
+                  target:`Wave 5 from here. W3-extended → W5 = 61.8% of W1`,
+                  invalid:`Overlap with wave 1 territory ($${ew.pts[1].v.toFixed(2)}) = count invalid — exit`};
+              } else if (w===3) {
+                obj={phase:`WAVE 3 IN PROGRESS — THE MONEY WAVE ${up}`,accent:'#00ff88',bg:'#011a0a',border:'#00ff88',badge:'WAVE 3 ★',
+                  primary:`Strongest, fastest leg — highest-conviction trend trade. Hold and ride.`,
+                  entry:`Stop below wave 2 ($${ew.pts[2].v.toFixed(2)}). Add on shallow pullbacks staying above wave 1 top.`,
+                  target:`161.8% W1 extension = $${(ew.pts[2].v+(ew.L1*1.618*(bull?1:-1))).toFixed(2)}. May reach 261.8%.`,
+                  invalid:`Close below wave 1 end ($${ew.pts[1].v.toFixed(2)}) = wave 3 failed — exit immediately`};
+              } else {
+                obj={phase:`WAVE ${w===1?'1 — IMPULSE STARTS':'2 — CORRECTIVE RETRACE'} ${w===1?up:dn}`,
+                  accent:w===1?'#ffdd00':'#ff6644',bg:w===1?'#141200':'#1a0800',border:w===1?'#ffdd00':'#ff6644',badge:`WAVE ${w}`,
+                  primary:w===1?`First leg of new ${bull?'bullish':'bearish'} impulse — wait for wave 2 to add full size`
+                    :`Deepest retrace before wave 3 launch — best entry window`,
+                  entry:w===1?`Small ${dir} position. Wait for wave 2 pullback to 50–61.8% of W1 to build size.`
+                    :`Best entry zone: 50–61.8% retrace of W1. Stop just below wave 1 origin ($${ew.pts[0].v.toFixed(2)}).`,
+                  target:w===1?`Initial target: wave 1 high for wave 3 setup`
+                    :`W3 launch: 161.8% of W1 = $${(ew.pts[0].v+(ew.L1*1.618*(bull?1:-1))).toFixed(2)}`,
+                  invalid:w===1?`Below wave 0 ($${ew.pts[0].v.toFixed(2)}) = not a valid impulse`
+                    :`Close below wave 1 origin ($${ew.pts[0].v.toFixed(2)}) = W2 ≥ 100% of W1 — count invalid`};
+              }
+
+              // ── 6 steps definition ───────────────────────────────────────
+              const steps=[
+                { n:1, label:'Enter Wave 3',       icon:'①',
+                  when:'Wave 2 completes at 50–61.8% retrace of Wave 1',
+                  action:`Enter ${dir} at Wave 2 bottom`,
+                  target:`Wave 3 target: ${w3Target} (161.8%) → ${w3Max} (261.8%)`,
+                  stop:`Stop: ${stopW1} — below Wave 1 origin (hard rule: W2 cannot exceed W1)`,
+                  size:'Full position — highest reward-to-risk in the entire cycle',
+                  accent:'#ffdd00' },
+                { n:2, label:'Ride Wave 3',         icon:'②',
+                  when:'Price accelerates away from Wave 2 low — fastest, longest leg',
+                  action:`Hold ${dir}. Add on shallow pullbacks above Wave 1 top`,
+                  target:`161.8% extension = ${w3Target}. May extend to ${w3Max}`,
+                  stop:`Trail stop below Wave 2 end (${stopW2})`,
+                  size:'Full position — the money wave, do not cut early',
+                  accent:'#00ff88' },
+                { n:3, label:'Re-enter at Wave 4',  icon:'③',
+                  when:'Wave 3 completes, pullback to 23.6–38.2% of Wave 3',
+                  action:`Take partial profit on Wave 3. Re-enter ${dir} at Wave 4 low`,
+                  target:`Wave 5 active targets: ${w5tgt}`,
+                  stop:`Stop: ${stopW1} — Wave 4 cannot overlap Wave 1 territory`,
+                  size:'Reduced position (50–60% of Wave 3 size) — lower conviction leg',
+                  accent:'#ff9900' },
+                { n:4, label:'Trade Wave 5',         icon:'④',
+                  when:'Wave 4 confirms reversal, new impulse begins',
+                  action:`Hold ${dir} with trailing stop from Wave 4 (${stopW4})`,
+                  target:`Active W5 targets: ${w5tgt}`,
+                  stop:`Close below Wave 4 (${stopW4}) = W3 may be terminal — exit`,
+                  size:'Watch RSI/MACD for divergence — exit at first sign of exhaustion',
+                  accent:'#00ccff' },
+                { n:5, label:'Exit — W5 Exhaustion', icon:'⑤',
+                  when:'Wave 5 complete. RSI/MACD divergence. Volume drying up.',
+                  action:`Close ALL ${dir} positions. Do NOT chase — impulse is spent`,
+                  target:`ABC correction will retrace 38.2–61.8% of entire ${bull?'rally':'decline'} from Wave 0 (${stopW1})`,
+                  stop:`New ${bull?'high':'low'} beyond Wave 5 = extended wave (rare) — stand aside`,
+                  size:'Flat — wait for ABC A leg to establish before initiating correction trade',
+                  accent:'#ff6644' },
+                { n:6, label:'Trade ABC Correction',  icon:'⑥',
+                  when:'After Wave 5 top/bottom. A–B–C corrective sequence unfolds.',
+                  action:abc?.ptB&&!abc.ptC?`Enter ${opp} on B-wave breakdown for C leg thrust`
+                    :abc?.ptA&&!abc.ptB?`Fade B-wave bounce near 50–78.6% retrace of A`
+                    :`Monitor A leg — enter ${opp} once A pivot confirms`,
+                  target:`C wave targets: ${ctgt}`,
+                  stop:abc?.ptB?`Stop above B pivot (${fmt(abc.ptB.v)}) — back above = flat correction`
+                    :`Stop above Wave 5 extreme (${fmt(ew.pts[5].v)})`,
+                  size:'Moderate position — corrections are choppier than impulses',
+                  accent:'#dd66ff' },
+              ];
+
+              return (
+                <div style={{background:'#07101f',border:'1px solid #1a3050',overflow:'hidden'}}>
+                  {/* Section header */}
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',
+                    padding:'8px 14px',background:'#060d1a',borderBottom:'1px solid #1a3050'}}>
+                    <div style={{fontSize:'9px',color:'#3a5a7a',letterSpacing:'2px'}}>
+                      ELLIOTT WAVE — 6 OBJECTIVES ROADMAP
+                    </div>
+                    <div style={{display:'flex',gap:'6px',alignItems:'center'}}>
+                      <span style={{fontSize:'8px',color:cfColor,background:cfColor+'18',
+                        border:`1px solid ${cfColor}44`,padding:'2px 7px',letterSpacing:'1px'}}>
+                        {cfLabel}
+                      </span>
+                      {(divB||divBear)&&(
+                        <span style={{fontSize:'8px',color:divB?'#00ff88':'#ff4466'}}>
+                          {divB?'▲ BULL DIV':'▼ BEAR DIV'}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Pattern info strip */}
+                  <div style={{padding:'5px 14px',background:'#060c18',borderBottom:'1px solid #0d1f35',
+                    fontSize:'8px',color:'#3a5a7a',display:'flex',gap:'16px'}}>
+                    <span>Pattern: <span style={{color:'#6a9aba'}}>{pat?.name||'—'} · {pat?.stage||'—'}</span></span>
+                    <span>RSI: <span style={{color:rsi<40?'#00ff88':rsi>65?'#ff4466':'#6a9aba'}}>{rsi.toFixed(0)}</span></span>
+                    <span>Vol: <span style={{color:volTrend>1.3?'#00ff88':'#6a9aba'}}>{volTrend.toFixed(1)}x</span></span>
+                    <span style={{color:'#4a6a8a',flex:1}}>{topNote}</span>
+                  </div>
+
+                  {/* Steps */}
+                  <div style={{padding:'8px 10px',display:'flex',flexDirection:'column',gap:'4px'}}>
+                    {steps.map(s=>{
+                      const isActive=s.n===activeStep;
+                      const isDone  =s.n<activeStep;
+                      const isFuture=s.n>activeStep;
+                      return (
+                        <div key={s.n} style={{
+                          display:'flex',gap:'10px',alignItems:'flex-start',
+                          padding:isActive?'10px 12px':'6px 12px',
+                          background:isActive?s.accent+'12':'transparent',
+                          border:isActive?`1px solid ${s.accent}44`:'1px solid transparent',
+                          borderLeft:isActive?`3px solid ${s.accent}`:isDone?'3px solid #1a3a1a':'3px solid #1a2a3a',
+                          opacity:isFuture?0.4:1,
+                          transition:'all 0.2s',
+                        }}>
+                          {/* Step number */}
+                          <div style={{flexShrink:0,width:'22px',height:'22px',borderRadius:'50%',
+                            display:'flex',alignItems:'center',justifyContent:'center',
+                            background:isActive?s.accent:isDone?'#1a3a1a':'#0d1828',
+                            border:`1.5px solid ${isActive?s.accent:isDone?'#2a5a2a':'#1a3050'}`,
+                            fontSize:'10px',color:isActive?'#060e1c':isDone?'#2a8a2a':'#2a4a6a',
+                            fontWeight:'bold'}}>
+                            {isDone?'✓':s.n}
+                          </div>
+
+                          {/* Content */}
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:isActive?'6px':'0'}}>
+                              <span style={{fontSize:'9px',fontWeight:'bold',
+                                color:isActive?s.accent:isDone?'#2a6a2a':'#2a4060',
+                                letterSpacing:'1px'}}>
+                                {s.icon} {s.label.toUpperCase()}
+                              </span>
+                              {isActive&&<span style={{fontSize:'8px',color:s.accent,background:s.accent+'22',
+                                padding:'1px 6px',letterSpacing:'1px'}}>ACTIVE NOW</span>}
+                            </div>
+
+                            {isActive&&(
+                              <div style={{display:'grid',gridTemplateColumns:'58px 1fr',gap:'3px 8px',fontSize:'8.5px',lineHeight:'1.55'}}>
+                                <span style={{color:s.accent,opacity:0.65,fontWeight:'bold'}}>WHEN</span>
+                                <span style={{color:'#7a9ab8'}}>{s.when}</span>
+                                <span style={{color:s.accent,opacity:0.65,fontWeight:'bold'}}>ACTION</span>
+                                <span style={{color:'#d0e8ff',fontWeight:'bold'}}>{s.action}</span>
+                                <span style={{color:s.accent,opacity:0.65,fontWeight:'bold'}}>TARGET $</span>
+                                <span style={{color:'#00ff88',fontWeight:'bold'}}>{s.target}</span>
+                                <span style={{color:'#ff4466',opacity:0.75,fontWeight:'bold'}}>STOP</span>
+                                <span style={{color:'#c07080'}}>{s.stop}</span>
+                                <span style={{color:s.accent,opacity:0.65,fontWeight:'bold'}}>SIZE</span>
+                                <span style={{color:'#7a9ab8'}}>{s.size}</span>
+                              </div>
+                            )}
+                            {!isActive&&(
+                              <div style={{fontSize:'8px',color:isDone?'#2a5a2a':'#1a3050',marginTop:'1px'}}>
+                                {isDone?`✓ Completed`:`${s.when}`}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* ── Candlestick chart ── */}
+            <div style={{background:'#070e1c',border:'1px solid #1a3050',padding:'8px'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'6px',padding:'0 4px'}}>
+                <div style={{fontSize:'9px',color:'#2a4a6a',letterSpacing:'1px'}}>
+                  WAVE STRUCTURE · bars {ew.pts[0].i}→{ew.pts[5].i} · Score {ew.score}/100 · {tf.toUpperCase()} CANDLES
+                </div>
+                {abc&&(
+                  <div style={{fontSize:'9px',color:'#dd66ff'}}>
+                    ABC {abc.complete?'✓':'…'} Q{abc.score}
+                  </div>
+                )}
+              </div>
+              <ElliottChart prices={effPrices} wave={ew} abc={abc}
+                width={Math.min(780,window.innerWidth-300)} height={270}/>
+              {/* Legend */}
+              <div style={{display:'flex',gap:'14px',padding:'6px 4px 0',flexWrap:'wrap',alignItems:'center'}}>
+                {['①','②','③','④','⑤'].map((num,i)=>(
+                  <span key={i} style={{fontSize:'9px',color:['#ffdd00','#ff6644','#00ff88','#ff9900','#00ccff'][i]}}>
+                    {num} {['Impulse','Corr.','Impulse','Corr.','Impulse'][i]}
+                  </span>
+                ))}
+                {abc&&['A','B','C'].map((l,i)=>(
+                  <span key={l} style={{fontSize:'9px',color:['#dd66ff','#ffcc44','#ff44aa'][i]}}>
+                    {l} {['Corrective','Counter','Thrust'][i]}
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {/* ── Wave metrics ── */}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'10px'}}>
+
+              {/* Fibonacci ratios */}
+              <div style={{background:'#0a1628',border:'1px solid #1a3050',padding:'12px'}}>
+                <div style={{fontSize:'9px',color:'#3a5a7a',letterSpacing:'2px',marginBottom:'10px'}}>FIBONACCI RATIOS</div>
+                {[
+                  { label:'Wave 2 retrace of W1', val:ew.w2ret, targets:[0.382,0.500,0.618,0.786], ideal:'38.2–61.8%' },
+                  { label:'Wave 3 extend of W1',  val:ew.w3ext, targets:[1.618,2.000,2.618],       ideal:'161.8%+' },
+                  { label:'Wave 4 retrace of W3', val:ew.w4ret, targets:[0.236,0.382,0.500],       ideal:'23.6–38.2%' },
+                  { label:'Wave 5 vs W1',         val:ew.w5eq1, targets:[0.618,1.000,1.618],       ideal:'61.8–100%' },
+                ].map(row=>{
+                  const closest=row.targets.reduce((b,t)=>Math.abs(row.val-t)<Math.abs(row.val-b)?t:b,row.targets[0]);
+                  const err=Math.abs(row.val-closest)/closest;
+                  const q=err<0.05?'#00ff88':err<0.12?'#ffaa00':'#ff4466';
+                  return (
+                    <div key={row.label} style={{marginBottom:'8px'}}>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:'2px'}}>
+                        <span style={{fontSize:'9px',color:'#4a6a8a'}}>{row.label}</span>
+                        <span style={{fontSize:'9px',color:q,fontWeight:'bold'}}>{fibPct(row.val)}</span>
+                      </div>
+                      <div style={{height:'3px',background:'#0d1f35',borderRadius:'2px'}}>
+                        <div style={{height:'100%',width:`${Math.min(100,Math.max(0,(1-err/0.15)*100))}%`,background:q,borderRadius:'2px'}}/>
+                      </div>
+                      <div style={{fontSize:'8px',color:'#1a3a5a',marginTop:'1px'}}>Ideal: {row.ideal}</div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Wave length comparison */}
+              <div style={{background:'#0a1628',border:'1px solid #1a3050',padding:'12px'}}>
+                <div style={{fontSize:'9px',color:'#3a5a7a',letterSpacing:'2px',marginBottom:'10px'}}>WAVE LENGTHS</div>
+                {[
+                  { num:1, len:ew.L1, color:'#ffdd00' },
+                  { num:3, len:ew.L3, color:'#00ff88' },
+                  { num:5, len:ew.L5, color:'#00ccff' },
+                ].map(w=>{
+                  const maxL=Math.max(ew.L1,ew.L3,ew.L5)||1;
+                  const isLongest=w.len===maxL;
+                  return (
+                    <div key={w.num} style={{marginBottom:'10px'}}>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:'3px'}}>
+                        <span style={{fontSize:'9px',color:w.color}}>Wave {w.num}{isLongest?' ★':''}</span>
+                        <span style={{fontSize:'9px',color:'#c8d8f0'}}>${w.len.toFixed(2)}</span>
+                      </div>
+                      <div style={{height:'6px',background:'#0d1f35',borderRadius:'3px'}}>
+                        <div style={{height:'100%',width:`${(w.len/maxL)*100}%`,background:w.color,opacity:0.7,borderRadius:'3px'}}/>
+                      </div>
+                    </div>
+                  );
+                })}
+                <div style={{marginTop:'8px',padding:'6px',background:'#070f1c',fontSize:'8px',color:'#2a4060',lineHeight:'1.6'}}>
+                  {ew.L3>=ew.L1&&ew.L3>=ew.L5
+                    ? '✓ Wave 3 is longest — textbook structure'
+                    : '⚠ Wave 3 not longest — less conventional'}
+                </div>
+              </div>
+            </div>
+
+            {/* ── 3 Hard Rules ── */}
+            <div style={{background:'#0a1628',border:'1px solid #1a3050',padding:'12px'}}>
+              <div style={{fontSize:'9px',color:'#3a5a7a',letterSpacing:'2px',marginBottom:'10px'}}>FROST & PRECHTER — 3 HARD RULES</div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:'8px'}}>
+                {[
+                  { rule:'Rule 1', desc:'Wave 2 retraces ≤100% of Wave 1', ok:ew.w2ret<1.0,
+                    detail:`W2 retraced ${fibPct(ew.w2ret)} of W1` },
+                  { rule:'Rule 2', desc:'Wave 3 is not the shortest impulse', ok:!(ew.L3<ew.L1&&ew.L3<ew.L5),
+                    detail:`W3=${ew.L3.toFixed(1)}, W1=${ew.L1.toFixed(1)}, W5=${ew.L5.toFixed(1)}` },
+                  { rule:'Rule 3', desc:'Wave 4 does not overlap Wave 1', ok:true,
+                    detail:'W4 stayed above W1 territory' },
+                ].map(r=>(
+                  <div key={r.rule} style={{background:r.ok?'#001808':'#200808',border:`1px solid ${r.ok?'#004422':'#440000'}`,padding:'10px',borderRadius:'2px'}}>
+                    <div style={{display:'flex',alignItems:'center',gap:'6px',marginBottom:'4px'}}>
+                      <span style={{color:r.ok?'#00ff88':'#ff4466',fontSize:'14px'}}>{r.ok?'✓':'✗'}</span>
+                      <span style={{fontSize:'9px',color:'#c8d8f0',fontWeight:'bold'}}>{r.rule}</span>
+                    </div>
+                    <div style={{fontSize:'9px',color:'#4a6a8a',marginBottom:'4px',lineHeight:'1.4'}}>{r.desc}</div>
+                    <div style={{fontSize:'8px',color:r.ok?'#2a6a2a':'#6a2a2a'}}>{r.detail}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* ── W5 Projections — active targets only (hidden once ABC starts) ── */}
+            {ew.waveStatus!=='complete'&&!abc?.ptA&&(()=>{
+              const curP=selStock.quote?.price||effPrices[effPrices.length-1]?.close||0;
+              const ahead=v=>ew.isBull?v>curP:v<curP;
+              const active=[
+                { label:'61.8% of W1', val:ew.projections.fib618,  color:'#3a8a5a', note:'Conservative' },
+                { label:'100% of W1',  val:ew.projections.fib100,  color:'#00ff88', note:'Most Common'  },
+                { label:'161.8% of W1',val:ew.projections.fib1618, color:'#00ffaa', note:'Extended'     },
+              ].filter(p=>isFinite(p.val)&&ahead(p.val));
+              if (!active.length) return null;
+              return (
+                <div style={{background:'#0a1628',border:'1px solid #1a3050',padding:'12px'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'10px'}}>
+                    <div style={{fontSize:'9px',color:'#3a5a7a',letterSpacing:'2px'}}>
+                      WAVE 5 ACTIVE TARGETS — from W4 @ ${ew.pts[4].v.toFixed(2)}
+                    </div>
+                    <div style={{fontSize:'8px',color:'#1a3a5a'}}>
+                      {3-active.length} target{3-active.length!==1?'s':''} already passed
+                    </div>
+                  </div>
+                  <div style={{display:'grid',gridTemplateColumns:`repeat(${active.length},1fr)`,gap:'8px'}}>
+                    {active.map(p=>{
+                      const pct=((p.val-curP)/curP)*100;
+                      return (
+                        <div key={p.label} style={{background:'#070f1c',border:`1px solid ${p.color}33`,padding:'10px',textAlign:'center'}}>
+                          <div style={{color:p.color,fontSize:'16px',fontWeight:'bold'}}>${p.val.toFixed(2)}</div>
+                          <div style={{color:'#3a5a7a',fontSize:'8px',marginTop:'2px'}}>{p.label}</div>
+                          <div style={{color:ew.isBull?'#00ff88':'#ff4466',fontSize:'10px',marginTop:'4px'}}>{pct>=0?'+':''}{pct.toFixed(1)}%</div>
+                          <div style={{color:'#1a3a5a',fontSize:'8px',marginTop:'2px'}}>{p.note}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* ── ABC Corrective Wave ── */}
+            {abc&&(
+            <div style={{background:'#090d1a',border:'1px solid #3a1a4a',padding:'12px'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'10px'}}>
+                <div style={{fontSize:'9px',color:'#7a3a9a',letterSpacing:'2px'}}>
+                  ABC CORRECTIVE SEQUENCE — {abc.complete?'COMPLETE':'IN PROGRESS'}
+                </div>
+                <div style={{fontSize:'9px',color:'#dd66ff',background:'#3a1a4a44',padding:'2px 8px'}}>
+                  Quality {abc.score}/100
+                </div>
+              </div>
+
+              {/* A / B / C leg cards */}
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:'8px',marginBottom:'10px'}}>
+                {[
+                  { leg:'A', pt:abc.ptA, prev:abc.origin, color:'#dd66ff',
+                    desc:`${abc.isBull?'Down from':'Up from'} W5 end @ $${abc.origin.v.toFixed(2)}`,
+                    len:abc.LA, ratio:null },
+                  { leg:'B', pt:abc.ptB, prev:abc.ptA,   color:'#ffcc44',
+                    desc:`Counter-move · ${abc.bRet!=null?fibPct(abc.bRet)+' of A':'pending'}`,
+                    len:abc.LB, ratio:abc.bRet },
+                  { leg:'C', pt:abc.ptC, prev:abc.ptB,   color:'#ff44aa',
+                    desc:`Thrust · ${abc.cEqA!=null?fibPct(abc.cEqA)+' of A':'pending'}`,
+                    len:abc.LC, ratio:abc.cEqA },
+                ].map(row=>{
+                  const isSet=!!row.pt;
+                  return (
+                    <div key={row.leg} style={{background:'#060e1a',border:`1px solid ${row.color}33`,padding:'10px'}}>
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'4px'}}>
+                        <span style={{color:row.color,fontWeight:'bold',fontSize:'16px'}}>{row.leg}</span>
+                        <span style={{fontSize:'8px',color:isSet?'#00ff88':'#ff9900'}}>{isSet?'✓ SET':'PENDING'}</span>
+                      </div>
+                      <div style={{fontSize:'8px',color:'#4a6a8a',lineHeight:'1.5',marginBottom:'4px'}}>{row.desc}</div>
+                      {row.len!=null&&(
+                        <div style={{fontSize:'11px',color:'#c8d8f0',fontWeight:'bold'}}>${row.len.toFixed(2)}</div>
+                      )}
+                      {row.pt&&(
+                        <div style={{fontSize:'8px',color:'#2a4060',marginTop:'2px'}}>@ ${row.pt.v.toFixed(2)}</div>
+                      )}
+                      {/* Fibonacci quality bar */}
+                      {row.ratio!=null&&(()=>{
+                        const refs=row.leg==='B'?[0.382,0.500,0.618]:[0.618,1.000,1.618];
+                        const err=Math.min(...refs.map(t=>Math.abs(row.ratio-t)/t));
+                        const q=err<0.05?'#00ff88':err<0.15?'#ffaa00':'#ff4466';
+                        return (
+                          <div style={{marginTop:'6px'}}>
+                            <div style={{height:'2px',background:'#0d1f35',borderRadius:'1px'}}>
+                              <div style={{height:'100%',width:`${Math.min(100,(1-err/0.20)*100)}%`,background:q,borderRadius:'1px'}}/>
+                            </div>
+                            <div style={{fontSize:'7px',color:q,marginTop:'1px'}}>
+                              Fib fit: {err<0.05?'Ideal':err<0.15?'Good':'Weak'}
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* C-wave price targets — active only */}
+              {abc.cTargets&&(()=>{
+                const curP=selStock.quote?.price||effPrices[effPrices.length-1]?.close||0;
+                // Correction direction is opposite to impulse
+                const aheadC=v=>abc.isBull?v<curP:v>curP;
+                const allC=[
+                  { label:'C = 61.8% A', val:abc.cTargets.fib618,  color:'#aa44cc', note:'Shallow' },
+                  { label:'C = A',        val:abc.cTargets.fib100,  color:'#dd66ff', note:'Most Common' },
+                  { label:'C = 161.8% A', val:abc.cTargets.fib1618, color:'#ffaaff', note:'Extended' },
+                ];
+                const activeC=allC.filter(p=>isFinite(p.val)&&aheadC(p.val));
+                if (!activeC.length) return null;
+                return (
+                <>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'6px'}}>
+                    <div style={{fontSize:'8px',color:'#5a2a7a',letterSpacing:'2px'}}>
+                      WAVE C ACTIVE TARGETS — from B @ ${abc.ptB?.v.toFixed(2)||'—'}
+                    </div>
+                    {activeC.length<3&&<div style={{fontSize:'7.5px',color:'#2a1a3a'}}>{3-activeC.length} passed</div>}
+                  </div>
+                  <div style={{display:'grid',gridTemplateColumns:`repeat(${activeC.length},1fr)`,gap:'6px',marginBottom:'10px'}}>
+                    {activeC.map(p=>{
+                      const pct=((p.val-(selStock.quote?.price||p.val))/(selStock.quote?.price||1))*100;
+                      return (
+                        <div key={p.label} style={{background:'#070f1c',border:`1px solid ${p.color}33`,padding:'8px',textAlign:'center'}}>
+                          <div style={{color:p.color,fontSize:'14px',fontWeight:'bold'}}>${p.val.toFixed(2)}</div>
+                          <div style={{color:'#3a3a5a',fontSize:'8px',marginTop:'2px'}}>{p.label}</div>
+                          <div style={{color:abc.isBull?'#ff4466':'#00ff88',fontSize:'9px',marginTop:'3px'}}>{pct>=0?'+':''}{pct.toFixed(1)}%</div>
+                          <div style={{color:'#2a2a4a',fontSize:'8px'}}>{p.note}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+                );
+              })()}
+
+              <div style={{padding:'8px',background:'#060c14',fontSize:'8px',color:'#3a2a5a',lineHeight:'1.7'}}>
+                <span style={{color:'#5a3a7a'}}>PRECHTER / NEELY — </span>
+                Zigzag (5-3-5): A subdivides as 5 waves, B retraces 50–78.6% of A, C equals A or 61.8%/161.8% of A.
+                Flat (3-3-5): B retraces &gt;80% of A, often re-testing the W5 extreme.
+                {abc.complete
+                  ? <span style={{color:'#dd66ff'}}> ABC complete — look for Wave (1) of next impulse or deeper nested correction.</span>
+                  : <span style={{color:'#ffcc44'}}> Sequence in progress — wait for {!abc.ptB?'B then C':'C leg'} confirmation before positioning.</span>}
+              </div>
+            </div>
+            )}
+
+            {/* ── Neely guidelines ── */}
+            <div style={{background:'#0a1628',border:'1px solid #1a3050',padding:'12px',marginBottom:'8px'}}>
+              <div style={{fontSize:'9px',color:'#3a5a7a',letterSpacing:'2px',marginBottom:'8px'}}>NEELY GUIDELINES — MASTERING ELLIOTT WAVE</div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'6px',fontSize:'9px',lineHeight:'1.7'}}>
+                <div style={{color:ew.w2ret>0.50&&ew.w4ret<0.382?'#00ff88':'#4a6a8a'}}>
+                  {ew.w2ret>0.50&&ew.w4ret<0.382?'✓':'○'} Alternation: W2 sharp / W4 flat
+                </div>
+                <div style={{color:ew.L3>=ew.L1&&ew.L3>=ew.L5?'#00ff88':'#4a6a8a'}}>
+                  {ew.L3>=ew.L1&&ew.L3>=ew.L5?'✓':'○'} Wave 3 longest (strongest)
+                </div>
+                <div style={{color:'#4a6a8a'}}>○ Channel: base line W1–W2, parallel from W3 end</div>
+                <div style={{color:ew.waveStatus==='forming'?'#ffaa00':'#4a6a8a'}}>
+                  {ew.waveStatus==='forming'?'▶':'○'} W5 RSI/MACD divergence expected
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // FILTERS — Professional swing trader presets
 // ══════════════════════════════════════════════════════════════════════════════
 const FILTERS = {
@@ -3719,7 +5326,7 @@ const FILTERS = {
 export default function SwingScanner() {
   const [stocks, setStocks]       = useState([]);
   const [selected, setSelected]   = useState(null);
-  const [tab, setTab]             = useState(typeof window!=="undefined"&&window.innerWidth<768?"picks":"scanner");
+  const [tab, setTab]             = useState("scanner");
   const [filter, setFilter]       = useState("Active Setups");
   const [sortBy, setSortBy]       = useState("score");
   const [search, setSearch]       = useState("");
@@ -3728,19 +5335,49 @@ export default function SwingScanner() {
   const [scanProgress, setScanProgress] = useState(0);
   const [isScanning, setIsScanning] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
-  const [watchlist, setWatchlist] = useState(DEFAULT_WATCHLIST);
+  const [watchlist, setWatchlist] = useState(()=>{
+    try {
+      const saved = JSON.parse(localStorage.getItem(WL_CACHE_KEY));
+      if (Array.isArray(saved) && saved.length > 0) return saved;
+    } catch {}
+    return DEFAULT_WATCHLIST;
+  });
   const [addSym, setAddSym]       = useState("");
   const abortRef = useRef(null);
   const isMobile = useIsMobile();
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
-  const [showTop10, setShowTop10] = useState(true);
+  const [isFromCache, setIsFromCache] = useState(false);
   const mono = "'Courier New','Lucida Console',monospace";
 
-  const loadSingle = useCallback(async (sym) => {
+  // Persist watchlist changes to localStorage
+  useEffect(()=>{
+    try { localStorage.setItem(WL_CACHE_KEY, JSON.stringify(watchlist)); } catch {}
+  },[watchlist]);
+
+  const loadSingle = useCallback(async (sym, { skipNetwork=false }={}) => {
     try {
       setLoadingMap(m=>({...m,[sym]:true}));
       setErrorMap(m=>({...m,[sym]:null}));
-      const [prices, quote] = await Promise.all([fetchHistory(sym), fetchQuote(sym)]);
+
+      let prices, quote;
+      const cached = dataCache[sym];
+      const isOnline = typeof navigator !== "undefined" ? navigator.onLine : true;
+
+      if (cached && (Date.now() - cached.ts < DATA_CACHE_TTL)) {
+        // Fresh in-memory cache hit — no network call needed
+        prices = cached.prices;
+        quote  = cached.quote;
+      } else if (!isOnline || skipNetwork) {
+        // Offline — use stale in-memory data if available, otherwise fail gracefully
+        if (cached) { prices = cached.prices; quote = cached.quote; }
+        else throw new Error("Offline – no cached data");
+      } else {
+        // Normal fetch
+        [prices, quote] = await Promise.all([fetchHistory(sym), fetchQuote(sym)]);
+        // Save to in-memory cache
+        dataCache[sym] = { prices, quote, ts: Date.now() };
+      }
+
       if (!prices||prices.length<20) throw new Error("Insufficient data");
 
       const pattern = (() => {
@@ -3778,8 +5415,8 @@ export default function SwingScanner() {
       })();
       if (targetHit) pattern.stage="Target Hit";
 
-      // Invalidation check
-      const { invalidated, reason: invalidReason } = checkPatternInvalidation(pattern, prices, quote.price);
+      // Invalidation check — scans full pattern history, not just current price
+      const { invalidated, reason: invalidReason, isBusted=false, bustedTarget=null } = checkPatternInvalidation(pattern, prices, quote.price);
       if (invalidated && pattern.stage!=="Target Hit") pattern.stage="Invalidated";
 
       // Risk/Reward
@@ -3791,7 +5428,8 @@ export default function SwingScanner() {
 
       setStocks(prev=>{
         const idx=prev.findIndex(s=>s.sym===sym);
-        const entry2={sym,prices,pattern,score,scoreBreakdown,quote,chg,rsi,macd,volData,divergence,trendStr,atr,sma20,sma50,relPos,targetPrice,targetMethod,targetHeight,targetBreakout,targetHit,invalidated,invalidReason,stop,rr};
+        const elliottWave = (() => { try { return detectElliottWave(prices); } catch(e) { return null; } })();
+        const entry2={sym,prices,pattern,score,scoreBreakdown,quote,chg,rsi,macd,volData,divergence,trendStr,atr,sma20,sma50,relPos,targetPrice,targetMethod,targetHeight,targetBreakout,targetHit,invalidated,invalidReason,isBusted,bustedTarget,stop,rr,elliottWave};
         if (idx>=0){const n=[...prev];n[idx]=entry2;return n;}
         return [...prev,entry2];
       });
@@ -3802,69 +5440,50 @@ export default function SwingScanner() {
     }
   },[]);
 
-  const runScan = useCallback(async(list)=>{
+  const runScan = useCallback(async(list, { backgroundRefresh=false }={})=>{
     if (abortRef.current) abortRef.current=false;
     abortRef.current=true;
-    setIsScanning(true); setStocks([]); setScanProgress(0); setErrorMap({});
 
-    // ── Cache layer: skip re-fetching symbols cached in last 15 min ──
-    const CACHE_KEY = "swingscanner_cache";
-    const CACHE_TTL = 15 * 60 * 1000; // 15 minutes
-    let cache = {};
-    try { cache = JSON.parse(localStorage.getItem(CACHE_KEY)||"{}"); } catch {}
-    const now = Date.now();
+    // ── Stale-while-revalidate: show cache instantly on initial load ──────────
+    if (!backgroundRefresh) {
+      const cached = loadScanCache();
+      if (cached) {
+        // Restore cached stocks immediately so the UI isn't blank
+        setStocks(cached.stocks);
+        setIsFromCache(true);
+        setLastUpdate(new Date(cached.ts));
+        setScanProgress(100);
 
-    let completed = 0;
-    const total = list.length;
-
-    // ── Fire ALL symbols in parallel, show results as each one finishes ──
-    await Promise.all(list.map(async sym => {
-      if (!abortRef.current) return;
-      // Serve from cache if fresh
-      if (cache[sym] && (now - cache[sym].ts) < CACHE_TTL) {
-        setStocks(prev => {
-          if (prev.find(s=>s.sym===sym)) return prev;
-          return [...prev, cache[sym].data];
-        });
-        completed++;
-        setScanProgress(Math.round((completed/total)*100));
-        return;
+        // If data is still fresh AND we're offline, skip network scan
+        const isOnline = typeof navigator !== "undefined" ? navigator.onLine : true;
+        if (!cached.stale && !isOnline) {
+          setIsScanning(false);
+          abortRef.current=false;
+          return;
+        }
+        // If online and data is stale (or always revalidate), do a bg refresh
+        // Small delay so the UI can paint the cached results first
+        await new Promise(r=>setTimeout(r,300));
       }
-      // Otherwise fetch
-      await loadSingle(sym);
-      completed++;
-      setScanProgress(Math.round((completed/total)*100));
-    }));
+    }
 
-    // ── Save fresh results to cache ──
-    setStocks(current => {
-      const updated = {...cache};
-      current.forEach(s => { updated[s.sym] = { ts: now, data: s }; });
-      try { localStorage.setItem(CACHE_KEY, JSON.stringify(updated)); } catch {}
-      return current;
-    });
+    setIsScanning(true);
+    if (!backgroundRefresh) { setStocks([]); setScanProgress(0); setErrorMap({}); }
+    const batchSize  = IS_MOBILE ? 2 : 3;
+    const batchDelay = IS_MOBILE ? 400 : 250;
+    for (let i=0; i<list.length; i+=batchSize) {
+      if (!abortRef.current) break;
+      await Promise.all(list.slice(i,i+batchSize).map(s=>loadSingle(s)));
+      setScanProgress(Math.round(Math.min(100,((i+batchSize)/list.length)*100)));
+      await new Promise(r=>setTimeout(r,batchDelay));
+    }
+    setIsScanning(false); setIsFromCache(false); setLastUpdate(new Date()); abortRef.current=false;
 
-    setIsScanning(false); setLastUpdate(new Date()); abortRef.current=false;
+    // Save fresh results to localStorage for next cold load
+    setStocks(cur => { saveScanCache(cur); return cur; });
   },[loadSingle]);
 
-  const runFullScan = useCallback(()=>runScan(watchlist),[runScan,watchlist]);
-
-  useEffect(()=>{
-    // ── Load cached data instantly so Top Picks shows on open ──
-    try {
-      const cache = JSON.parse(localStorage.getItem("swingscanner_cache")||"{}");
-      const CACHE_TTL = 15 * 60 * 1000;
-      const fresh = Object.values(cache)
-        .filter(c => (Date.now() - c.ts) < CACHE_TTL)
-        .map(c => c.data);
-      if (fresh.length > 0) {
-        setStocks(fresh);
-        setLastUpdate(new Date(Object.values(cache)[0]?.ts||Date.now()));
-      }
-    } catch {}
-    // Then run a fresh scan in background
-    runScan(watchlist);
-  },[]);
+  useEffect(()=>{runScan(watchlist);},[]);
 
   const filtered = stocks
     .filter(s=>FILTERS[filter](s))
@@ -3877,8 +5496,6 @@ export default function SwingScanner() {
       sortBy==="chg"         ? b.chg-a.chg :
       sortBy==="rr"          ? b.rr-a.rr : b.score-a.score);
 
-  const displayStocks = (isMobile && showTop10) ? filtered.slice(0, 10) : filtered;
-
   const sel = selected ? stocks.find(s=>s.sym===selected) : null;
 
   // Top picks
@@ -3890,7 +5507,7 @@ export default function SwingScanner() {
   const breakColor  = (b)  => b==="bullish"?"#00ff88":b==="bearish"?"#ff4466":"#ffaa00";
 
   return (
-    <div style={{background:"#060e1c",color:"#c8d8f0",fontFamily:mono,minHeight:"100vh",fontSize:"12px",paddingBottom:isMobile?"72px":"0"}}>
+    <div style={{background:"#060e1c",color:"#c8d8f0",fontFamily:mono,minHeight:"100vh",fontSize:"12px",paddingBottom:isMobile?"64px":"0"}}>
 
       {/* ── HEADER ── */}
       <div style={{background:"#080f1e",borderBottom:"1px solid #1a3050",padding:isMobile?"8px 12px":"10px 18px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
@@ -3911,9 +5528,12 @@ export default function SwingScanner() {
               </div>
             </div>
           )}
-          {!isMobile&&lastUpdate&&!isScanning&&<div style={{textAlign:"right"}}>
-            <div style={{fontSize:"8px",color:"#3a5a7a"}}>LAST SCAN</div>
-            <div style={{color:"#00ff88",fontSize:"10px"}}>{lastUpdate.toLocaleTimeString()}</div>
+          {lastUpdate&&!isScanning&&<div style={{textAlign:"right"}}>
+            {isFromCache&&<div style={{fontSize:"8px",color:"#ffaa00",letterSpacing:"0.5px",marginBottom:"1px"}}>
+              {typeof navigator!=="undefined"&&!navigator.onLine?"📵 OFFLINE":"⚡ CACHED"}
+            </div>}
+            {!isMobile&&<div style={{fontSize:"8px",color:"#3a5a7a"}}>LAST SCAN</div>}
+            <div style={{color:isFromCache?"#ffaa00":"#00ff88",fontSize:"10px"}}>{lastUpdate.toLocaleTimeString()}</div>
           </div>}
           <div style={{textAlign:"right"}}>
             <div style={{fontSize:"8px",color:"#3a5a7a"}}>LOADED</div>
@@ -3924,19 +5544,12 @@ export default function SwingScanner() {
             padding:isMobile?"6px 10px":"6px 14px",cursor:isScanning?"default":"pointer",letterSpacing:"1px",fontSize:"10px"}}>
             ⟳{isMobile?"":" RESCAN"}
           </button>
-          {isMobile&&!isScanning&&stocks.length>0&&stocks.length<watchlist.length&&(
-            <button onClick={runFullScan}
-              style={{background:"#0d2a10",border:"1px solid #1a6030",color:"#00ff88",
-              padding:"6px 10px",cursor:"pointer",letterSpacing:"1px",fontSize:"9px"}}>
-              +ALL {watchlist.length}
-            </button>
-          )}
         </div>
       </div>
 
-      {/* ── TABS — Desktop: full bar, Mobile: bottom 2-tab nav ── */}
+      {/* ── TABS ── */}
       {!isMobile&&<div style={{display:"flex",background:"#080f1c",borderBottom:"1px solid #1a3050",overflowX:"auto"}}>
-        {[["scanner","SCANNER"],["picks","TOP PICKS"],["rotation","SECTOR ROTATION"],["intermarket","INTERMARKET"],["heatmap","HEATMAP"],["watchlist","WATCHLIST"],["guide","PATTERN GUIDE"],["bottomfinder","📉 BOTTOM FINDER"]].map(([k,label])=>(
+        {[["scanner","SCANNER"],["picks","TOP PICKS"],["rotation","SECTOR ROTATION"],["intermarket","INTERMARKET"],["heatmap","HEATMAP"],["watchlist","WATCHLIST"],["guide","PATTERN GUIDE"],["bottomfinder","📉 BOTTOM FINDER"],["elliott","〜 ELLIOTT WAVE"]].map(([k,label])=>(
           <button key={k} onClick={()=>setTab(k)} style={{
             background:tab===k?"#0d1f3c":"transparent", border:"none",
             borderBottom:tab===k?"2px solid #00d4ff":"2px solid transparent",
@@ -3945,26 +5558,6 @@ export default function SwingScanner() {
           }}>{label}</button>
         ))}
       </div>}
-
-      {/* Mobile bottom tab bar — Top Picks & Bottom Finder only */}
-      {isMobile&&(
-        <div style={{position:"fixed",bottom:0,left:0,right:0,zIndex:600,
-          background:"#080f1e",borderTop:"1px solid #1a3050",
-          display:"flex",height:"56px"}}>
-          {[["picks","⭐","TOP PICKS"],["bottomfinder","📉","BOTTOM FINDER"]].map(([k,icon,label])=>(
-            <button key={k} onClick={()=>setTab(k)} style={{
-              flex:1,background:tab===k?"#0d1f3c":"transparent",border:"none",
-              borderTop:tab===k?"2px solid #00d4ff":"2px solid transparent",
-              color:tab===k?"#00d4ff":"#3a5a7a",
-              display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
-              cursor:"pointer",fontFamily:mono,gap:"2px",
-            }}>
-              <span style={{fontSize:"20px",lineHeight:1}}>{icon}</span>
-              <span style={{fontSize:"9px",letterSpacing:"1px"}}>{label}</span>
-            </button>
-          ))}
-        </div>
-      )}
 
       {/* ══ SCANNER TAB ══ */}
       {tab==="scanner"&&(
@@ -3989,15 +5582,7 @@ export default function SwingScanner() {
                 <option value="rsi">↓ RSI</option>
                 <option value="chg">↓ % CHG</option>
               </select>
-              <span style={{fontSize:"10px",color:"#3a5a7a"}}>{isMobile&&showTop10?`TOP 10 of ${filtered.length}`:filtered.length+" results"}</span>
-              {isMobile&&(
-                <button onClick={()=>setShowTop10(v=>!v)}
-                  style={{background:showTop10?"#00d4ff22":"#0d1f3c",border:`1px solid ${showTop10?"#00d4ff":"#1a4060"}`,
-                    color:showTop10?"#00d4ff":"#3a5a7a",padding:"4px 10px",cursor:"pointer",
-                    fontFamily:mono,fontSize:"10px",letterSpacing:"1px",borderRadius:"2px"}}>
-                  {showTop10?"TOP 10 ✓":"ALL"}
-                </button>
-              )}
+              <span style={{fontSize:"10px",color:"#3a5a7a"}}>{filtered.length} results</span>
               <span style={{marginLeft:"auto",fontSize:"9px",color:"#1a3a5a"}}>
                 {stocks.filter(s=>s.pattern.stage==="Confirmed").length} confirmed · {stocks.filter(s=>s.divergence?.bullDiv||s.divergence?.bearDiv).length} divergences · <span style={{color:"#ff6600"}}>{stocks.filter(s=>s.pattern.stage==="Invalidated").length} invalidated</span>
               </span>
@@ -4020,7 +5605,7 @@ export default function SwingScanner() {
                   <div style={{fontSize:"10px",marginTop:"8px",color:"#1a3050"}}>Fetching OHLCV data · Detecting {Object.keys(PATTERNS_DB).length} pattern types</div>
                 </div>
               )}
-              {displayStocks.map(s=>{
+              {filtered.map(s=>{
                 const isSel=selected===s.sym;
                 const dc=breakColor(s.pattern.breakout);
                 const cc=s.chg>=0?"#00ff88":"#ff4466";
@@ -4144,8 +5729,23 @@ export default function SwingScanner() {
                     </div>
                   )}
                   {sel.invalidated&&(
-                    <div style={{marginTop:"5px",background:"#1e0800",border:"2px solid #ff6600",padding:"6px 10px",fontSize:"9px",color:"#ff6600",letterSpacing:"1px"}}>
-                      ⚠ PATTERN INVALIDATED — {sel.invalidReason}
+                    <div style={{marginTop:"5px",background:"#1e0800",border:"2px solid #ff6600",padding:"8px 10px",fontSize:"9px",color:"#ff6600",letterSpacing:"1px"}}>
+                      <div>⚠ PATTERN INVALIDATED — {sel.invalidReason}</div>
+                      {sel.isBusted && sel.bustedTarget && (
+                        <div style={{marginTop:"6px",borderTop:"1px solid #ff660033",paddingTop:"6px",display:"flex",alignItems:"center",gap:"12px",flexWrap:"wrap"}}>
+                          <span style={{color:"#ff4444",fontWeight:"bold",fontSize:"10px"}}>
+                            ☠ BUSTED PATTERN
+                          </span>
+                          <span style={{color:"#ffaa00"}}>
+                            Bulkowski downside target:&nbsp;
+                            <strong style={{color:"#ff4444",fontSize:"11px"}}>${sel.bustedTarget.toFixed(2)}</strong>
+                            &nbsp;({(((sel.bustedTarget - sel.quote?.price) / sel.quote?.price)*100).toFixed(1)}% from here)
+                          </span>
+                          <span style={{color:"#aa5533",fontSize:"8px"}}>
+                            Busted patterns avg 35%+ move opposite to original setup — Bulkowski Ch.11
+                          </span>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -4271,6 +5871,65 @@ export default function SwingScanner() {
                 <div style={{fontSize:"8px",color:"#1a3050",marginTop:"6px"}}>Ref: {sel.pattern.murphyRef} · {sel.pattern.category} Pattern</div>
               </div>
 
+              {/* ── Murphy Pattern Intelligence (triangles) ───────────────────── */}
+              {sel.pattern.geo?.type === "triangle" && (()=>{
+                const geo     = sel.pattern.geo;
+                const isBear  = sel.pattern.breakout === "bearish";
+                const isBull  = sel.pattern.breakout === "bullish";
+                const bta     = geo.barsToApex ?? null;
+                const comp    = geo.completionPct ?? null;
+                const volOk   = geo.volContracting;
+                const tTop    = geo.topTouches ?? 0;
+                const tBot    = geo.botTouches ?? 0;
+                // MA alignment check
+                const p = sel.quote?.price, s20 = sel.sma20, s50 = sel.sma50;
+                const bearMAStack = isBear && p && s20 && s50 && p < s20 && s20 < s50;
+                const bullMAStack = isBull && p && s20 && s50 && p > s20 && s20 > s50;
+                // Apex timing quality (Murphy: breakout should happen 2/3→3/4 of way to apex)
+                const apexZone = comp != null && comp >= 60 && comp <= 80;
+                const apexLate = comp != null && comp > 80;
+                const chipStyle = (col) => ({ display:"inline-flex", alignItems:"center", gap:"4px", padding:"3px 8px",
+                  background: col+"18", border:`1px solid ${col}44`, color: col, fontSize:"9px",
+                  fontFamily:"monospace", letterSpacing:"0.5px", borderRadius:"2px" });
+                return (
+                  <div style={{background:"#06101e", border:"1px solid #0f2035", padding:"10px 12px", marginBottom:"2px"}}>
+                    <div style={{fontSize:"8px",color:"#2a4060",letterSpacing:"2px",marginBottom:"7px"}}>MURPHY PATTERN INTEL — Ch.6</div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:"5px",marginBottom:"6px"}}>
+                      {/* Touch count */}
+                      {(tTop>0||tBot>0)&&<span style={chipStyle("#8899bb")}>
+                        {tTop} RES touch{tTop!==1?"es":""} · {tBot} SUP touch{tBot!==1?"es":""}
+                        {(tTop>=3||tBot>=3)?" ✓ HIGH CONF":""}
+                      </span>}
+                      {/* Volume contraction */}
+                      {volOk
+                        ? <span style={chipStyle("#00cc88")}>▼ VOL CONTRACTING ✓ — Murphy confirmation</span>
+                        : <span style={chipStyle("#ff8800")}>⚠ VOLUME NOT CONTRACTING — watch for false break</span>}
+                      {/* MA alignment */}
+                      {bearMAStack && <span style={chipStyle("#ff4466")}>BEARISH MA STACK ✓ (price &lt; SMA20 &lt; SMA50)</span>}
+                      {bullMAStack && <span style={chipStyle("#00ff88")}>BULLISH MA STACK ✓ (price &gt; SMA20 &gt; SMA50)</span>}
+                    </div>
+                    {/* Apex progress bar */}
+                    {comp != null && bta != null && (
+                      <div>
+                        <div style={{display:"flex",justifyContent:"space-between",fontSize:"8px",color:"#3a5a7a",marginBottom:"3px"}}>
+                          <span>PATTERN COMPLETION — apex in ~{bta} bar{bta!==1?"s":""}</span>
+                          <span style={{color: apexLate?"#ff8800": apexZone?"#00ff88":"#5a9acf"}}>
+                            {comp}% {apexZone?"✓ IDEAL BREAKOUT ZONE": apexLate?"⚠ GETTING LATE — breakout overdue":"→ still building"}
+                          </span>
+                        </div>
+                        <div style={{height:"5px",background:"#0a1828",borderRadius:"2px",overflow:"hidden"}}>
+                          <div style={{height:"100%", width:`${comp}%`,
+                            background: apexLate?"#ff8800": apexZone?"#00ff88":"#2a6aaa",
+                            borderRadius:"2px", transition:"width 0.3s"}}/>
+                        </div>
+                        <div style={{display:"flex",justifyContent:"space-between",fontSize:"7px",color:"#1a3050",marginTop:"2px"}}>
+                          <span>Start</span><span style={{color:"#2a5080"}}>← Ideal zone: 60–80% →</span><span>Apex</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
               {/* Trade Setup */}
               <div style={{background:sel.pattern.breakout==="bullish"?"#080f08":"#0f0808",
                 border:`1px solid ${sel.pattern.breakout==="bullish"?"#1a3a1a":"#3a1a1a"}`,padding:"12px"}}>
@@ -4322,10 +5981,12 @@ export default function SwingScanner() {
                     <div>► Trend: {sel.sma20&&sel.quote?.price>sel.sma20?"✓ Price above SMA20":"⚠ Price below SMA20 — trend not confirmed"}</div>
                     <div>► Pattern {sel.pattern.stage==="Confirmed"?"✓ CONFIRMED BREAKOUT — highest probability":"forming — wait for close above resistance"}</div>
                   </>):sel.pattern.breakout==="bearish"?(<>
-                    <div>► Entry: Short below <strong style={{color:"#ffdd00"}}>${sel.pattern.geo?.support?.toFixed(2)||"support"}</strong> on elevated volume</div>
-                    <div>► Volume confirm: {sel.volData.trend>1.2?"✓ Volume surging":"⚠ Wait for volume to confirm breakdown"}</div>
-                    <div>► RSI: {sel.rsi>=60?"✓ In bear entry zone (60+)":"⚠ RSI not in ideal short zone"}</div>
-                    <div>► Pattern {sel.pattern.stage==="Confirmed"?"✓ CONFIRMED BREAKDOWN":"forming — wait for close below support"}</div>
+                    <div>► Entry: Short below <strong style={{color:"#ffdd00"}}>${sel.pattern.geo?.support?.toFixed(2)||"support"}</strong> on elevated volume (1.5×+ avg)</div>
+                    <div>► Murphy 3% filter: confirmed breakdown requires close below <strong style={{color:"#ff8800"}}>${sel.pattern.geo?.support ? (sel.pattern.geo.support*0.97).toFixed(2) : "—"}</strong> (support × 0.97)</div>
+                    <div>► Volume confirm: {sel.volData.trend>1.2?"✓ Volume surging — breakdown confirmed":"⚠ Volume below avg — wait for surge on breakdown bar"}</div>
+                    <div>► MA alignment: {sel.sma20&&sel.sma50&&sel.quote?.price<sel.sma20&&sel.sma20<sel.sma50?"✓ Bearish MA stack — price below SMA20 below SMA50":"⚠ MA stack not fully aligned bearish"}</div>
+                    <div>► RSI: {sel.rsi<=45?"✓ RSI below 45 — momentum confirming downtrend":sel.rsi<=60?"⚠ RSI mid-range — watch for divergence near support":"⚠ RSI elevated — potential oversold bounce risk after breakdown"}</div>
+                    <div>► Pattern {sel.pattern.stage==="Confirmed"?"✓ CONFIRMED BREAKDOWN — highest probability":"forming — wait for close below support on expanding volume"}</div>
                   </>):(<>
                     <div>► Neutral — wait for directional break</div>
                     <div>► Monitor both resistance and support levels</div>
@@ -4428,6 +6089,10 @@ export default function SwingScanner() {
 
       {tab==="bottomfinder"&&(
         <BottomFinderTab mono={mono}/>
+      )}
+
+      {tab==="elliott"&&(
+        <ElliottWaveTab stocks={stocks} selected={selected} setSelected={setSelected} mono={mono}/>
       )}
 
       {/* ══ PATTERN GUIDE TAB ══ */}
